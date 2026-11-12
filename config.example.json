@@ -1,0 +1,39 @@
+{
+  "rpcUrl": "https://bsc-rpc.publicnode.com",
+  "pollMs": 1200,
+  "watchWallets": [],
+  "walletFile": "wallets.local.json",
+  "journalPath": "state/transactions.sqlite",
+  "maxGasPriceGwei": "0.25",
+  "gasLimitCap": 10000000,
+  "maxTotalBnb": "0.5",
+  "targets": [
+    {
+      "url": "https://flap.sh/apps/corla/mint/0x9b540b85d7dc7f3db4fbb7cebc45fb2214667777?mint=0x4bdd60107d9a1da95e03be6b6e972fa57ea62fd3&factory=0xfba753f8b890eb35caa000c427f99ed5903ea517&catalogVersion=4&lang=zh",
+      "mintBatches": 0,
+      "autoClaim": true,
+      "buyOnLaunch": false
+    },
+    {
+      "url": "https://flap.sh/apps/corla/mint/0xc402b65aa0a6ef7562a1580fd778397d6e817777?mint=0x4724ce75d772eda774147f6198f1a876811d6e19&factory=0xfba753f8b890eb35caa000c427f99ed5903ea517&catalogVersion=4&lang=zh",
+      "mintBatches": 1,
+      "maxMintPriceBnb": "0.1",
+      "autoClaim": true,
+      "buyOnLaunch": true
+    }
+  ],
+  "snipe": {
+    "amountBnb": "0.01",
+    "walletCount": 1,
+    "minLiquidityBnb": "1",
+    "slippageBps": 1000,
+    "maxOpeningPremiumBps": 1000,
+    "requirePreopen": false,
+    "maxBuyTaxBps": 500,
+    "maxSellTaxBps": 500,
+    "maxPriceImpactBps": 1000,
+    "windowBlocks": 15,
+    "deadlineSeconds": 12,
+    "repeatAttempts": 1
+  }
+}

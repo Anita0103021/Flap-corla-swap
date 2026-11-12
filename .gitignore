@@ -1,0 +1,13 @@
+node_modules/
+*.local.json
+.env
+.env.*
+keystores/
+state/
+reports/
+*.sqlite
+*.sqlite-*
+
+*.dpapi
+*.ndjson
+*.log

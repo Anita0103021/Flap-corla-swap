@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="night">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#11131a">
+  <title>Corla Desk · Mint 与开盘狙击</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/themes.css">
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <svg class="symbol-sheet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 9a6 6 0 0 1 12 0c0 5 2 6 2 8H4c0-2 2-3 2-8Zm4 11a2.1 2.1 0 0 0 4 0"/></symbol>
+      <symbol id="i-butterfly" viewBox="0 0 24 24"><path d="M12 12C9.2 8.4 6.2 4 2.8 5.3.2 6.3 1.6 14 7 14.2c-3.5 1.8-2 5.7.8 4.5 2-.9 3.1-3.4 4.2-5.5m0-1.2c2.8-3.6 5.8-8 9.2-6.7 2.6 1 1.2 8.7-4.2 8.9 3.5 1.8 2 5.7-.8 4.5-2-.9-3.1-3.4-4.2-5.5m0 0v4.3M9.3 4.7 12 9.2l2.7-4.5"/></symbol>
+      <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.3"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.3"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.3"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.3"/></symbol>
+      <symbol id="i-discover" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/></symbol>
+      <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M19 8V5.8A1.8 1.8 0 0 0 16.8 4L5.5 6.3A2 2 0 0 0 4 8.3V18a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2H6m15 4h-4a2 2 0 0 0 0 4h4m-4-2h.01"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M6 4v4m0 4v8m6-16v9m0 4v3m6-16v3m0 4v9M3 8h6m0 9h6m0-10h6"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5m-11 5v-5h5"/><path d="M5.5 8.5a7.5 7.5 0 0 1 12.3-2l2.2 5.5M4 12l2.2 5.5a7.5 7.5 0 0 0 12.3-2"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 12 7-12 7V5Z"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.6"/></symbol>
+      <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+      <symbol id="i-cube" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Zm0 9 8-4.5M4 7.5l8 4.5m0 0v9"/></symbol>
+      <symbol id="i-progress" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 1-9 9"/><path d="M12 7v5l3 2M4 6l.01.01M8 3.9l.01.01"/></symbol>
+      <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13.5 2.8 5 13h6l-.5 8.2L19 11h-6l.5-8.2Z"/></symbol>
+      <symbol id="i-link" viewBox="0 0 24 24"><path d="M13 5h6v6m0-6-9 9m8-1v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="m14 5 5 5M5 19l1.1-4.6L16.5 4a1.8 1.8 0 0 1 2.5 0l1 1a1.8 1.8 0 0 1 0 2.5L9.6 17.9 5 19Z"/></symbol>
+      <symbol id="i-activity" viewBox="0 0 24 24"><path d="M3 12h4l3-7 4 14 3-7h4"/></symbol>
+      <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 5 2.7 8 7 10 4.3-2 7-5 7-10V6l-7-3Z"/><path d="m9 12 2 2 4-4"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+      <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h12l3 3v12a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/></symbol>
+      <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v2"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 6.5h15M9 6.5V4h6v2.5m3 0-1 13H7l-1-13m4 4v5m4-5v5"/></symbol>
+      <symbol id="i-eye" viewBox="0 0 24 24"><path d="M3 12s3.3-5.5 9-5.5 9 5.5 9 5.5-3.3 5.5-9 5.5S3 12 3 12Z"/><circle cx="12" cy="12" r="2"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M15 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2m0 15v2m9.5-9.5h-2m-15 0h-2m16.2-6.7-1.4 1.4M6.7 17.3l-1.4 1.4m13.4 0-1.4-1.4M6.7 6.7 5.3 5.3"/></symbol>
+      <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 15A8.8 8.8 0 0 1 9 3.5 8.9 8.9 0 1 0 20.5 15Z"/></symbol>
+      <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20.5 3.5c-1 1.1-2.7 1.8-5.4 2C9.2 6 5 8.7 5 13a5.9 5.9 0 0 0 5.9 6c5 0 9.6-4.9 9.6-15.5ZM3.5 21c3-4.5 6.4-7.2 10.6-9.4"/></symbol>
+    </defs>
+  </svg>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="Corla Desk 首页">
+        <span class="brand-mark"><svg class="icon"><use href="#i-butterfly"></use></svg></span>
+        <span class="brand-text">Corla Desk<small>本地交易工作台</small></span>
+      </a>
+      <div class="nav-label">工作区</div>
+      <nav aria-label="工作区">
+        <a href="#overview" class="nav-item active" aria-label="Mint 工作区" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#i-grid"></use></svg><span class="nav-text" aria-hidden="true">Mint 工作区</span><span class="nav-short" aria-hidden="true">Mint</span></a>
+        <a href="#snipe" class="nav-item" aria-label="开盘狙击"><svg class="icon" aria-hidden="true"><use href="#i-bolt"></use></svg><span class="nav-text" aria-hidden="true">开盘狙击</span><span class="nav-short" aria-hidden="true">狙击</span></a>
+        <a href="#discover" class="nav-item" aria-label="代币看板"><svg class="icon" aria-hidden="true"><use href="#i-discover"></use></svg><span class="nav-text" aria-hidden="true">代币看板</span><span class="nav-short" aria-hidden="true">看板</span></a>
+        <a href="#wallets" class="nav-item" aria-label="钱包管理"><svg class="icon" aria-hidden="true"><use href="#i-wallet"></use></svg><span class="nav-text" aria-hidden="true">钱包管理</span><span class="nav-short" aria-hidden="true">钱包</span></a>
+        <a href="#settings" class="nav-item" aria-label="预算与 Gas"><svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span class="nav-text" aria-hidden="true">预算与 Gas</span><span class="nav-short" aria-hidden="true">设置</span></a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="side-security"><svg class="icon"><use href="#i-shield"></use></svg><span>仅本机可用<small>钱包私钥加密保存</small></span></div>
+        <div class="side-version">CORLA CATALOG V4</div>
+      </div>
+    </aside>
+    <div class="workbench">
+      <header class="topbar">
+        <div class="breadcrumb">工作区 <svg class="icon"><use href="#i-chevron"></use></svg> <strong id="crumb">Mint 工作区</strong></div>
+        <div class="top-indicators">
+          <span class="network-tag"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 4 4-1.7 1.7L12 6.4 9.7 8.7 8 7l4-4Zm7 7 1.7 1.7L19 13.4l-1.7-1.7L19 10ZM5 10l1.7 1.7L5 13.4l-1.7-1.7L5 10Zm7 0 1.7 1.7L12 13.4l-1.7-1.7L12 10Zm-2.3 4.7L12 17l2.3-2.3 1.7 1.7-4 4-4-4 1.7-1.7Z"/></svg> BNB Chain <small>56</small></span>
+          <span class="connection-tag"><span id="connection-dot" class="dot"></span><span id="connection-label">连接中</span></span>
+        </div>
+        <fieldset id="theme-picker" class="theme-control">
+          <legend class="sr-only">外观主题</legend>
+          <label class="theme-option" title="白天主题"><input class="sr-only" type="radio" name="theme" value="day"><svg class="icon" aria-hidden="true"><use href="#i-sun"></use></svg><span>白天</span></label>
+          <label class="theme-option" title="夜间主题"><input class="sr-only" type="radio" name="theme" value="night" checked><svg class="icon" aria-hidden="true"><use href="#i-moon"></use></svg><span>夜间</span></label>
+          <label class="theme-option" title="护眼主题"><input class="sr-only" type="radio" name="theme" value="care"><svg class="icon" aria-hidden="true"><use href="#i-leaf"></use></svg><span>护眼</span></label>
+        </fieldset>
+      </header>
+      <main>
+        <div id="fatal" class="notice danger" hidden role="alert"></div>
+        <button id="reload-local-ui" class="btn secondary" type="button" hidden>重新加载页面</button>
+        <section id="view-overview" class="view">
+          <div class="page-heading">
+            <div><div class="eyebrow"><span></span>CORLA / BSC 主网</div><h1>Mint 工作区</h1><p>选项目、设每钱包批数；Mint 完成开盘后自动领币。</p></div>
+            <div class="heading-actions">
+              <button id="refresh" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"></use></svg>刷新链上</button>
+              <button id="start-live" class="btn primary" type="button" disabled><svg class="icon"><use href="#i-play"></use></svg>启动 Mint 实盘</button>
+              <button id="stop" class="btn stop" type="button" hidden><svg class="icon"><use href="#i-stop"></use></svg>停止 Mint</button>
+            </div>
+          </div>
+          <div id="run-alert" class="notice danger" hidden role="alert"></div>
+          <div class="metrics" aria-label="监控摘要">
+            <div class="metric"><span class="metric-icon tone-violet"><svg class="icon"><use href="#i-cube"></use></svg></span><div><small>监控项目</small><strong id="count-projects">—</strong></div></div>
+            <div class="metric"><span class="metric-icon tone-amber"><svg class="icon"><use href="#i-progress"></use></svg></span><div><small>筹资中</small><strong id="count-funding">—</strong></div></div>
+            <div class="metric"><span class="metric-icon tone-green"><svg class="icon"><use href="#i-bolt"></use></svg></span><div><small>已开盘</small><strong id="count-launched">—</strong></div></div>
+            <div class="metric"><span class="metric-icon tone-blue"><svg class="icon"><use href="#i-wallet"></use></svg></span><div><small>实盘钱包</small><strong id="count-wallets">—</strong></div></div>
+          </div>
+          <div class="overview-grid">
+            <section class="panel projects-panel" aria-labelledby="projects-title">
+              <div class="panel-heading"><div><h2 id="projects-title">项目列表</h2><p id="block-label">等待链上快照</p><p id="refresh-status" class="refresh-status" aria-live="polite" hidden></p></div><button id="add-project" class="btn secondary compact" type="button"><svg class="icon"><use href="#i-plus"></use></svg>添加项目</button></div>
+              <div id="projects" class="project-list"><div class="empty">正在读取本地配置…</div></div>
+            </section>
+            <section class="panel monitor-panel" aria-labelledby="monitor-title">
+              <div class="panel-heading"><div><h2 id="monitor-title">运行状态</h2><p>BSC 主网自动执行</p></div><svg class="icon panel-icon"><use href="#i-activity"></use></svg></div>
+              <div class="monitor-inner">
+                <div class="mode-display"><span id="mode-indicator" class="dot"></span><strong id="mode-label">待机</strong></div>
+                <p id="mode-copy">待机期间只读链上数据，不发送交易。</p>
+                <dl class="stats"><div><dt>项目配置</dt><dd id="config-source">—</dd></div><div><dt>自动领币项目</dt><dd id="claim-count">—</dd></div><div><dt>预算上限</dt><dd id="budget-label">—</dd></div></dl>
+                <a id="manage-wallets" class="btn secondary wide" href="#wallets"><svg class="icon"><use href="#i-wallet"></use></svg>管理实盘钱包</a>
+                <small id="live-caption" class="hint">启动前需核对策略并解锁钱包。</small>
+              </div>
+            </section>
+          </div>
+          <section class="panel logs-panel" aria-labelledby="logs-title">
+            <div class="panel-heading"><div><h2 id="logs-title">运行日志</h2><p>仅展示本次服务的最近记录</p></div><label class="sr-only" for="log-filter">日志筛选</label><select id="log-filter" class="compact-select"><option value="all">全部事件</option><option value="trades">交易事件</option><option value="errors">异常和跳过</option></select></div>
+            <div id="logs" class="logs-list"><div class="empty">暂无运行日志</div></div>
+          </section>
+        </section>
+        <section id="view-snipe" class="view" hidden>
+          <div class="page-heading">
+              <div><div class="eyebrow"><span></span>CORLA / BSC 主网</div><h1>开盘狙击</h1><p>支持单次或限次竞争；启动后自动保存可分享的速度记录。</p></div>
+            <div class="heading-actions">
+              <button id="snipe-refresh" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"></use></svg>刷新链上</button>
+              <button id="start-snipe" class="btn primary" type="button" disabled><svg class="icon"><use href="#i-play"></use></svg>启动狙击实盘</button>
+              <button id="stop-snipe" class="btn stop" type="button" hidden><svg class="icon"><use href="#i-stop"></use></svg>停止狙击</button>
+            </div>
+          </div>
+          <div id="snipe-run-alert" class="notice danger" hidden role="alert"></div>
+          <div class="overview-grid workspace-grid">
+            <section class="panel projects-panel" aria-labelledby="snipe-projects-title">
+              <div class="panel-heading"><div><h2 id="snipe-projects-title">狙击名单</h2><p id="snipe-block-label">等待链上快照</p><p id="snipe-refresh-status" class="refresh-status" aria-live="polite" hidden></p></div><button id="add-snipe" class="btn secondary compact" type="button"><svg class="icon"><use href="#i-plus"></use></svg>添加目标</button></div>
+              <div id="snipe-projects" class="project-list"><div class="empty">正在读取本地配置…</div></div>
+            </section>
+            <section class="panel monitor-panel" aria-labelledby="snipe-monitor-title">
+              <div class="panel-heading"><div><h2 id="snipe-monitor-title">狙击状态</h2><p>不追买启动前已开盘的币</p></div><svg class="icon panel-icon"><use href="#i-bolt"></use></svg></div>
+              <div class="monitor-inner">
+                <div class="mode-display"><span id="snipe-mode-indicator" class="dot"></span><strong id="snipe-mode-label">待机</strong></div>
+                <p id="snipe-mode-copy">待机期间不发送交易。</p>
+                <dl class="stats"><div><dt>单钱包买入额</dt><dd id="snipe-amount-label">—</dd></div><div><dt>买入钱包数量</dt><dd id="snipe-wallet-count">—</dd></div><div><dt>预算上限</dt><dd id="snipe-budget-label">—</dd></div></dl>
+                <small id="snipe-live-caption" class="hint">启动前需核对策略并解锁钱包。</small>
+                <p class="hint" id="snipe-report-row" hidden>测速记录：<code id="snipe-report-path"></code> <button type="button" id="copy-snipe-report" class="btn secondary compact">复制文件路径</button></p>
+              </div>
+            </section>
+          </div>
+          <form id="snipe-form" class="settings-stack">
+            <section class="panel">
+              <div class="panel-heading"><div><h2>狙击参数</h2><p>使用钱包列表中最前面的指定数量钱包。Gas 和预算在「预算与 Gas」设置。</p></div><svg class="icon panel-icon"><use href="#i-sliders"></use></svg></div>
+              <div class="panel-form">
+                <div class="field-grid">
+                  <label class="field"><span>单钱包买入额 <small>BNB</small></span><input name="amountBnb" inputmode="decimal" placeholder="0.01" required></label>
+                  <label class="field"><span>买入钱包数量</span><input name="walletCount" type="number" min="1" max="32" required></label>
+                  <label class="field"><span>当前报价滑点上限 <small>%</small></span><input name="slippageBps" type="number" min="0.01" max="10" step="0.01" data-bps-percent aria-describedby="snipe-slippage-hint" required></label>
+                  <label class="field"><span>开盘价溢价上限 <small>%</small></span><input name="maxOpeningPremiumBps" type="number" min="0" max="10" step="0.01" data-bps-percent aria-describedby="snipe-opening-price-hint" required></label>
+                  <label class="field"><span>每项目每钱包最多提交 <small>次</small></span><input name="repeatAttempts" type="number" min="1" max="5" step="1" aria-describedby="snipe-attempts-hint" required></label>
+                </div>
+                <p class="hint" id="snipe-slippage-hint">当前报价滑点限制报价到成交之间的偏差，不限制报价已比开盘价涨了多少。</p>
+                <p class="hint" id="snipe-opening-price-hint">开盘价溢价限制补买价格相对开盘基准的上涨幅度。0% 表示不得高于开盘价，不是关闭保护。</p>
+                <p class="hint" id="snipe-attempts-hint">1 次为确认后单次。2–5 次为竞争模式：可提前发单，回退会花 Gas，成交或结果不明时不会叠单。</p>
+                <div class="snipe-opening-policy">
+                  <label class="checkbox-row"><input name="requirePreopen" type="checkbox" aria-describedby="snipe-preopen-hint snipe-preopen-error"><span>没抢到开盘就不追<small id="snipe-preopen-hint">只尝试可核验的开盘前机会；检测到开盘或代币已部署就不再新签。需设为每钱包最多提交 2–5 次。</small></span></label>
+                  <p class="hint snipe-preopen-error" id="snipe-preopen-error" role="status" hidden>请把「每项目每钱包最多提交」设为 2–5 次，或关闭此开关。</p>
+                </div>
+                <details class="advanced-settings">
+                  <summary>更多风控参数</summary>
+                  <div class="field-grid">
+                    <label class="field"><span>最低池储备 <small>BNB</small></span><input name="minLiquidityBnb" inputmode="decimal" placeholder="1" required></label>
+                    <label class="field"><span>最大价格冲击 <small>%</small></span><input name="maxPriceImpactBps" type="number" min="0.01" max="10" step="0.01" data-bps-percent required></label>
+                    <label class="field"><span>最大买税 <small>bps</small></span><input name="maxBuyTaxBps" type="number" min="0" max="2000" required></label>
+                    <label class="field"><span>最大卖税 <small>bps</small></span><input name="maxSellTaxBps" type="number" min="0" max="2000" required></label>
+                    <label class="field"><span>开盘窗口 <small>区块</small></span><input name="windowBlocks" type="number" min="1" max="100" required></label>
+                    <label class="field"><span>报价有效期 <small>秒</small></span><input name="deadlineSeconds" type="number" min="5" max="60" required></label>
+                      <label class="field"><span>HTTP 补扫间隔 <small>毫秒</small></span><input name="scanMs" type="number" min="200" max="5000" step="1" required></label>
+                  </div>
+                    <p class="hint">默认节点支持 WSS 推送；自定义 RPC 可在本机设置 <code>BSC_WSS_URL</code>。缩短补扫间隔会增加请求频率，遇到限流不一定更快。</p>
+                </details>
+                <div class="form-actions"><button class="btn primary" type="submit"><svg class="icon"><use href="#i-save"></use></svg>保存狙击参数</button></div>
+              </div>
+            </section>
+          </form>
+          <section class="panel logs-panel" aria-labelledby="snipe-logs-title">
+            <div class="panel-heading"><div><h2 id="snipe-logs-title">狙击日志</h2><p>仅展示狙击工作区的最近记录</p></div><label class="sr-only" for="snipe-log-filter">狙击日志筛选</label><select id="snipe-log-filter" class="compact-select"><option value="all">全部事件</option><option value="trades">交易事件</option><option value="errors">异常和跳过</option></select></div>
+            <div id="snipe-logs" class="logs-list"><div class="empty">暂无狙击日志</div></div>
+          </section>
+        </section>
+        <section id="view-discover" class="view" hidden>
+          <div class="page-heading catalog-heading">
+            <div><div class="eyebrow"><span></span>CORLA / BNB CHAIN</div><h1>代币看板</h1><p>查看新项目和 Mint 进度，选币不会发交易。</p></div>
+            <div class="catalog-live" title="仅在看板可见时读取链上目录，不会发送交易。"><span id="catalog-live-dot" class="dot"></span><span id="catalog-live-label" role="status">自动连接中</span></div>
+          </div>
+          <div class="catalog-toolbar">
+            <div id="catalog-filters" class="catalog-filters" role="group" aria-label="项目阶段">
+              <button type="button" class="catalog-filter" data-catalog-filter="all" aria-pressed="true">全部</button>
+              <button type="button" class="catalog-filter" data-catalog-filter="funding" aria-pressed="false">筹资中</button>
+              <button type="button" class="catalog-filter" data-catalog-filter="ending" aria-pressed="false" title="24 小时内截止且仍可认购">即将结束</button>
+              <button type="button" class="catalog-filter" data-catalog-filter="launched" aria-pressed="false">已开盘</button>
+              <button type="button" class="catalog-filter" data-catalog-filter="ended" aria-pressed="false">已结束</button>
+            </div>
+            <div class="catalog-query">
+              <div class="catalog-search">
+                <label class="sr-only" for="catalog-search">搜索代币</label><svg class="icon" aria-hidden="true"><use href="#i-search"></use></svg>
+                <input id="catalog-search" type="search" maxlength="100" autocomplete="off" enterkeyhint="search" placeholder="搜索名称、符号或合约">
+                <button id="catalog-clear" class="catalog-clear icon-button" type="button" aria-label="清除搜索" title="清除搜索" hidden><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button>
+              </div>
+              <label class="sr-only" for="catalog-sort">项目排序</label>
+              <select id="catalog-sort" class="compact-select" aria-label="项目排序"><option value="latest">最新创建</option><option value="progress">筹资进度</option><option value="ending">最早截止</option></select>
+              <a id="catalog-notification-link" class="btn secondary compact catalog-notification-link" href="#settings" aria-label="桌面通知设置" title="桌面通知设置"><svg class="icon" aria-hidden="true"><use href="#i-bell"></use></svg>通知</a>
+            </div>
+          </div>
+          <div class="catalog-caption"><p id="catalog-summary" aria-live="polite">正在准备链上目录…</p><p id="catalog-updated">尚未同步</p></div>
+          <p class="notice" id="catalog-notice" hidden role="status"></p>
+          <div id="discover-results" class="catalog-grid"><div class="empty roomy catalog-empty">正在读取 Corla 项目…</div></div>
+          <div class="catalog-footer"><button id="catalog-more" class="btn secondary" type="button" hidden><svg class="icon"><use href="#i-plus"></use></svg>加载更多项目</button></div>
+        </section>
+        <section id="view-wallets" class="view" hidden>
+          <div class="page-heading">
+            <div><div class="eyebrow"><span></span>CORLA / 本地钱包</div><h1>钱包管理</h1><p>导入用于 BSC 主网交易的 EVM 私钥，最多管理 32 个钱包。</p></div>
+            <div class="heading-actions"><button id="import-wallet" class="btn primary" type="button" disabled><svg class="icon"><use href="#i-plus"></use></svg>导入私钥</button></div>
+          </div>
+          <section class="panel" aria-labelledby="wallet-list-title">
+            <div class="panel-heading"><div><h2 id="wallet-list-title">实盘钱包</h2><p id="wallet-count-label">正在读取本地钱包…</p></div><svg class="icon panel-icon"><use href="#i-wallet"></use></svg></div>
+            <div id="wallet-list" class="wallet-list"><p class="empty">正在读取本地钱包…</p></div>
+          </section>
+          <div class="notice wallet-notice" id="wallet-help"><svg class="icon"><use href="#i-shield"></use></svg><div><strong>私钥只提交给本机服务，加密后保存</strong><p>请备份原始私钥和钱包库密码。删除这里只移除本地钱包，不会转移链上资金。开盘买入按列表顺序使用前 N 个钱包。</p></div></div>
+          <div class="notice wallet-notice" id="wallet-local-unlock-panel" hidden><svg class="icon"><use href="#i-lock"></use></svg><div><strong>本机免密码</strong><p id="wallet-local-unlock-copy">输入原密码一次，开启 Windows 本机免密码。</p><button id="wallet-remember-local-unlock" class="btn secondary compact" type="button">开启本机免密码</button><button id="wallet-forget-local-unlock" class="btn secondary compact" type="button" hidden>关闭本机免密码</button></div></div>
+        </section>
+        <section id="view-settings" class="view" hidden>
+          <div class="page-heading"><div><div class="eyebrow"><span></span>CORLA / 通用风控</div><h1>预算与 Gas</h1><p>管理两个工作区共用的预算、Gas 上限、轮询间隔及桌面通知。</p></div></div>
+          <section id="notifications-panel" class="panel notification-panel" aria-labelledby="notifications-title">
+            <div class="panel-heading">
+              <div><h2 id="notifications-title">Chrome 桌面通知</h2><p>只读监测 Corla 链上事件，不会发交易。</p></div>
+              <span id="notifications-state" class="badge" role="status">已关闭</span>
+            </div>
+            <div class="panel-form notification-controls">
+              <label class="checkbox-row notification-master"><input id="notifications-enabled" type="checkbox" role="switch"><span>开启桌面通知<small>总开关。开启后可分别选择要接收的提醒。</small></span></label>
+              <label class="checkbox-row notification-option"><input id="notifications-whitelist" type="checkbox" role="switch" checked disabled><span>白名单通知<small>检测到新创建且启用白名单的 Corla Mint 时提醒。</small></span></label>
+              <label class="checkbox-row notification-option"><input id="notifications-burst" type="checkbox" role="switch" checked disabled><span>异常 Mint 通知<small>任意滚动 60 秒内新增认购超过项目总批数的 1/3，达阈值就提醒，不等满 60 秒。</small></span></label>
+              <p id="notifications-help" class="hint notification-help">请保持本地控制台页面打开，切换到别的标签页也可收到提醒。关闭页面或系统拦截时不会弹窗。</p>
+              <div class="notification-actions">
+                <button id="notifications-permission" type="button" class="btn secondary compact" hidden>授权浏览器通知</button>
+                <button id="notifications-test" type="button" class="btn secondary compact" disabled>发送测试通知</button>
+              </div>
+            </div>
+          </section>
+          <form id="settings-form" class="settings-stack">
+            <section class="panel"><div class="panel-heading"><div><h2>预算与执行</h2><p>按本次启动的工作区计算，包含交易本金及最坏 Gas 支出。</p></div><svg class="icon panel-icon"><use href="#i-shield"></use></svg></div>
+              <div class="panel-form field-grid">
+                <label class="field"><span>实盘总预算上限 <small>BNB</small></span><input name="maxTotalBnb" inputmode="decimal" placeholder="0.5" required></label>
+                <label class="field"><span>最高 Gas 价格 <small>Gwei</small></span><input name="maxGasPriceGwei" inputmode="decimal" placeholder="0.25" required></label>
+                <label class="field"><span>每笔 Gas 上限</span><input name="gasLimitCap" type="number" min="21000" max="15000000" required></label>
+                <label class="field"><span>轮询间隔 <small>毫秒</small></span><input name="pollMs" type="number" min="300" max="30000" required></label>
+                <div class="field-foot"><span>100 bps = 1%。末笔 Mint 可能触发合约部署和建池，Gas 明显高于普通 Mint。</span><span>RPC 由本地服务管理，节点状态见下方。</span></div>
+              </div>
+            </section>
+            <div class="form-actions"><button class="btn primary" type="submit"><svg class="icon"><use href="#i-save"></use></svg>保存通用参数</button></div>
+          </form>
+          <section class="panel rpc-panel" aria-labelledby="rpc-title">
+            <div class="panel-heading"><div><h2 id="rpc-title">RPC 节点</h2><p>各用途独立显示 HTTP 节点测速、备用切换和恢复状态。</p></div><span id="rpc-sync" class="badge" role="status">读取中…</span></div>
+            <div id="rpc-pools" class="rpc-pools"><p class="empty rpc-placeholder">正在读取节点状态…</p></div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+  <dialog id="project-dialog" aria-labelledby="project-dialog-title">
+    <form id="project-form" class="dialog-form">
+      <div class="dialog-heading"><div><h2 id="project-dialog-title">添加 Mint 项目</h2><p>设置参与钱包和目标批数。每笔 Mint 一批，价格由项目合约决定。</p></div><button class="icon-button" type="button" data-close="project-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <label class="field" for="project-url"><span>Corla Mint 链接</span><input type="url" id="project-url" autocomplete="off" placeholder="https://flap.sh/apps/corla/mint/…" required></label>
+      <div class="preview-line"><span id="project-preview" aria-live="polite">粘贴链接后自动读取价格与限额。</span><button id="project-preview-button" class="btn secondary compact" type="button">读取链上参数</button></div>
+      <div class="field-grid mint-fields">
+        <label class="field" for="project-batches"><span>每钱包目标批数</span><input id="project-batches" type="number" min="0" max="32" step="1" placeholder="等待读取链上数据" aria-describedby="project-qty-hint" required></label>
+        <div class="field"><span id="project-price-label">每批应付 <small>链上固定</small></span><output id="project-price" class="chain-value" aria-labelledby="project-price-label" aria-live="polite">等待读取</output></div>
+      </div>
+      <small class="hint mint-qty-hint" id="project-qty-hint">剩余份额够时默认每地址上限，不够时默认 1 批；填 0 不 Mint，已有批次计入目标。</small>
+      <label class="checkbox-row"><input type="checkbox" id="project-claim"><span>开盘后自动领币<small>仅检查参与钱包有无未领取份额；也可只开启领币。</small></span></label>
+      <details id="project-wallet-picker" class="mint-wallet-picker">
+        <summary id="project-wallet-summary">参与钱包</summary>
+        <div class="mint-wallet-tools">
+          <button id="project-wallet-sufficient" class="btn secondary compact" type="button" disabled>全选余额足够的钱包</button>
+          <button id="project-wallet-refresh" class="btn secondary compact" type="button"><svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>刷新余额</button>
+        </div>
+        <p id="project-wallet-balance-status" class="hint mint-wallet-status" role="status"></p>
+        <div id="project-wallet-choices" class="wallet-choice-list"></div>
+        <small class="hint mint-wallet-help">按剩余 Mint 批数和 Gas 上限筛选；仅领币需有未领取份额。可手动勾选，保存时固定名单。</small>
+      </details>
+      <p id="project-estimate" class="mint-estimate" aria-live="polite"></p>
+      <p class="notice danger modal-error" id="project-error" hidden role="alert"></p>
+      <div class="form-actions project-actions"><button id="delete-project" type="button" class="btn danger-text" hidden>移除项目</button><span class="spacer"></span><button class="btn secondary" type="button" data-close="project-dialog">取消</button><button class="btn secondary" type="submit">保存项目</button><button id="project-save-review" class="btn primary" type="submit" data-review="mint">保存并核对启动</button></div>
+    </form>
+  </dialog>
+  <dialog id="snipe-add-dialog" aria-labelledby="snipe-add-title">
+    <form id="snipe-add-form" class="dialog-form" method="dialog">
+      <div class="dialog-heading"><div><h2 id="snipe-add-title">添加狙击目标</h2><p>只加入狙击名单，不改变 Mint 工作区。</p></div><button class="icon-button" type="button" data-close="snipe-add-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <label class="field" for="snipe-url"><span>Corla Mint 链接</span><input type="url" id="snipe-url" autocomplete="off" placeholder="https://flap.sh/apps/corla/mint/…" required></label>
+      <p id="snipe-add-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button class="btn secondary" type="button" data-close="snipe-add-dialog">取消</button><button class="btn primary" type="submit">加入狙击名单</button></div>
+    </form>
+  </dialog>
+  <dialog id="project-remove-dialog" aria-labelledby="project-remove-title">
+    <form id="project-remove-form" class="dialog-form" method="dialog">
+      <div class="dialog-heading"><div><h2 id="project-remove-title">移除项目</h2><p id="project-remove-copy">项目将从监控列表移除，不会撤销已经发送的交易。</p></div><button class="icon-button" type="button" data-close="project-remove-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <p id="project-remove-target" class="dialog-address mono"></p>
+      <p id="project-remove-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button class="btn secondary" type="button" data-close="project-remove-dialog">取消</button><button id="project-remove-submit" class="btn stop" type="submit">确认移除</button></div>
+    </form>
+  </dialog>
+  <dialog id="wallet-import-dialog" aria-labelledby="wallet-import-title">
+    <form id="wallet-import-form" class="dialog-form" method="dialog" autocomplete="off" novalidate>
+      <div class="dialog-heading"><div><h2 id="wallet-import-title">导入钱包私钥</h2><p>每行一个 64 位十六进制私钥（可带 0x）。只接受私钥，不接受助记词。</p></div><button class="icon-button" type="button" data-close="wallet-import-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <div class="secret-field">
+        <label class="field" for="wallet-private-keys"><span>私钥列表</span><textarea id="wallet-private-keys" class="mono secret-mask" rows="4" maxlength="3000" autocomplete="off" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore required></textarea></label>
+        <button id="wallet-keys-visibility" type="button" class="btn secondary compact" aria-pressed="false"><svg class="icon"><use href="#i-eye"></use></svg>显示私钥</button>
+      </div>
+      <label class="field"><span>钱包备注 <small>可选，仅单个钱包</small></span><input id="wallet-label" type="text" maxlength="40" autocomplete="off" placeholder="例：Mint 01"></label>
+      <label class="field" id="wallet-import-password-row"><span>钱包库密码 <small id="wallet-password-note">至少 12 个字符</small></span><input id="wallet-import-password" type="password" maxlength="512" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore required></label>
+      <label class="field" id="wallet-password-repeat-row"><span>再输入一次钱包库密码</span><input id="wallet-password-repeat" type="password" maxlength="512" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore></label>
+      <p id="wallet-import-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button class="btn secondary" type="button" data-close="wallet-import-dialog">取消</button><button id="wallet-import-submit" class="btn primary" type="submit">加密并导入</button></div>
+    </form>
+  </dialog>
+  <dialog id="wallet-remove-dialog" aria-labelledby="wallet-remove-title">
+    <form id="wallet-remove-form" class="dialog-form" method="dialog" autocomplete="off" novalidate>
+      <div class="dialog-heading"><div><h2 id="wallet-remove-title">删除本地钱包</h2><p>删除后此工具无法再使用该钱包。请先确认你有私钥备份。</p></div><button class="icon-button" type="button" data-close="wallet-remove-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <p id="wallet-remove-target" class="dialog-address mono"></p>
+      <label class="field" id="wallet-remove-password-row"><span>钱包库密码</span><input id="wallet-remove-password" type="password" maxlength="512" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore required></label>
+      <p id="wallet-remove-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button class="btn secondary" type="button" data-close="wallet-remove-dialog">取消</button><button id="wallet-remove-submit" class="btn stop" type="submit">确认删除</button></div>
+    </form>
+  </dialog>
+  <dialog id="wallet-local-unlock-dialog" aria-labelledby="wallet-local-unlock-dialog-title">
+    <form id="wallet-local-unlock-form" class="dialog-form" method="dialog" autocomplete="off">
+      <div class="dialog-heading"><div><h2 id="wallet-local-unlock-dialog-title">开启本机免密码</h2><p>输入一次原钱包库密码。以后由当前 Windows 账号解锁，私钥仍加密保存。</p></div><button class="icon-button" type="button" data-close="wallet-local-unlock-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <label class="field"><span>原钱包库密码</span><input id="wallet-local-unlock-password" type="password" maxlength="512" autocomplete="new-password" autocapitalize="off" spellcheck="false" required></label>
+      <p id="wallet-local-unlock-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button class="btn secondary" type="button" data-close="wallet-local-unlock-dialog">取消</button><button id="wallet-local-unlock-submit" class="btn primary" type="submit">启用本机免密码</button></div>
+    </form>
+  </dialog>
+  <dialog id="live-dialog" aria-labelledby="live-title">
+    <form id="live-form" class="dialog-form" method="dialog" autocomplete="off" novalidate>
+      <div class="dialog-heading"><div><div class="eyebrow live-text"><span></span>BSC 主网 / REAL TRANSACTIONS</div><h2 id="live-title">确认实盘策略</h2><p>启用后可能自动发送主网交易并花费真实 BNB。</p></div><button id="live-close-review" class="icon-button" type="button" data-close="live-dialog" aria-label="关闭"><svg class="icon"><use href="#i-close"></use></svg></button></div>
+      <div id="live-summary" class="live-summary"></div>
+      <label class="field" id="live-password-row"><span>钱包库密码</span><input id="live-password" type="password" maxlength="512" autocomplete="new-password" autocapitalize="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore required></label>
+      <label class="checkbox-row" id="live-remember-local-row" hidden><input id="live-remember-local" type="checkbox" checked><span>以后在本机免输钱包库密码<small>首次需要原密码。由当前 Windows 账号保护，私钥仍加密。</small></span></label>
+      <p id="live-local-unlock-note" class="hint" hidden>已启用 Windows 本机解锁，本次无需输入钱包库密码。</p>
+      <p id="live-start-progress" class="notice modal-error" hidden role="status"></p>
+      <p id="live-error" class="notice danger modal-error" hidden role="alert"></p>
+      <div class="form-actions"><button id="live-cancel-review" class="btn secondary" type="button" data-close="live-dialog">取消</button><button id="live-cancel-startup" class="btn secondary" type="button" hidden>取消启动</button><button id="live-submit" class="btn stop" type="submit" disabled>确认并启动实盘</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

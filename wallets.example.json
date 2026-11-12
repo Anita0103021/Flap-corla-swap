@@ -1,0 +1,4 @@
+[
+  { "keystore": "keystores/wallet-1.json", "passwordEnv": "CORLA_WALLET_1_PASSWORD" },
+  { "keystore": "keystores/wallet-2.json", "passwordEnv": "CORLA_WALLET_2_PASSWORD" }
+]
