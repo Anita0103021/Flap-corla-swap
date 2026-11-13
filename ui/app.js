@@ -17,6 +17,7 @@ const PRIVATE_KEY = /^(?:0x)?[0-9a-fA-F]{64}$/;
 const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
 const UINT = /^(?:0|[1-9]\d*)$/;
 const TOKEN_FACTORY = '0xfba753f8b890eb35caa000c427f99ed5903ea517';
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const defaults = {
   snipe: { amountBnb: '0.01', walletCount: 1, minLiquidityBnb: '1', slippageBps: 1000, maxOpeningPremiumBps: 1000,
     maxPriceImpactBps: 1000, maxBuyTaxBps: 500, maxSellTaxBps: 500, windowBlocks: 15, deadlineSeconds: 12,
@@ -39,6 +40,7 @@ const METADATA_TTL_MS = 10 * 60_000;
 const CATALOG_LIMIT = 18;
 const CATALOG_STATUS_LIMIT = 32;
 const CATALOG_REFRESH_MS = 3000;
+const CATALOG_STATUS_RETRY_MAX_MS = 30_000;
 const CATALOG_TERMINAL_RECHECK_MS = 60_000;
 const CATALOG_ENDING_SEC = 24 * 60 * 60;
 const CATALOG_FUNDING_LIMIT = 18;
@@ -46,7 +48,7 @@ const RPC_POOL_LABELS = { dashboard: '看板与项目状态', metadata: '目录�
 const catalog = {
   rows: [], statuses: new Map(), lookups: new Map(), nextCursor: null, total: null, loaded: false,
   filter: 'all', sort: 'latest', query: '', busy: '', reading: 0, error: '', statusError: '',
-  statusReadAt: new Map(), statusOffset: 0, lastUpdated: 0, lastBlock: 0, headBlock: 0, failures: 0,
+  statusReadAt: new Map(), statusFailures: new Map(), statusOffset: 0, lastUpdated: 0, lastBlock: 0, headBlock: 0, failures: 0,
   resumePending: false, morePending: false, pendingMetadata: new Map(),
   fundingRows: new Map(), fundingTimes: new Map(), fundingReading: false, fundingNextAt: 0,
 };
@@ -312,7 +314,8 @@ function projectSnapshot(url) {
   if (!parsed) return null;
   const row = state.projects.find(p => projectKey(p) === projectKey(parsed) && !p.error);
   const listed = catalog.statuses.get(projectKey(parsed));
-  return listed && !listed.error && Number(listed.block ?? 0) > Number(row?.block ?? 0) ? listed : row;
+  return catalogQuote(listed).kind === 'native' && Number(listed.block ?? 0) > Number(row?.block ?? 0) ? listed :
+    catalogQuote(row).kind === 'token' ? null : row;
 }
 function matchWallets(target, wallets) {
   if (target.mintWallets === undefined) return wallets;
@@ -1285,8 +1288,9 @@ function catalogProgress(row) {
   return minted === null || total === null || total === 0n ? null :
     Number(minted >= total ? 1000n : minted * 1000n / total);
 }
-function catalogPhase(status, now) {
-  if (!status || status.error || typeof status.launched !== 'boolean') return ['unknown', status?.error ? '状态未读到' : '读取状态…', ''];
+function catalogPhase(status, now, failed = false) {
+  if (!status || status.error || typeof status.launched !== 'boolean') return failed || status?.error ?
+    ['unknown', '状态暂未读到', 'amber'] : ['unknown', '读取状态…', ''];
   if (status.launched) return ['launched', '已开盘', 'green'];
   const deadline = catalogTimestamp(status.fundingDeadline);
   if (status.emergencyWithdrawn || status.phase === 2 || (deadline && deadline <= now)) return ['ended', '已结束', ''];
@@ -1358,6 +1362,26 @@ function catalogRow(project) {
   const verified = parsedTarget(project ?? {});
   return verified && projectKey(verified) === projectKey(project) ? { ...project, ...verified } : null;
 }
+function catalogQuote(status) {
+  if (!status || status.error) return { kind: 'unknown' };
+  const address = HEX_ADDRESS.test(status.quoteToken ?? '') ? status.quoteToken : '';
+  // A token address takes precedence over a claimed native flag. The factory
+  // directory itself has no payment currency, so unknown must never mean BNB.
+  if (validAddress(address)) {
+    const symbol = metaText(status.quoteSymbol).replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 20);
+    const unit = symbol ? (/^bnb$/i.test(symbol.normalize('NFKC')) ? symbol + '（ERC-20）' : symbol) : short(address);
+    const decimals = Number.isInteger(status.quoteDecimals) && status.quoteDecimals >= 0 && status.quoteDecimals <= 255 ?
+      status.quoteDecimals : null;
+    return { kind: 'token', unit, address, decimals };
+  }
+  if (status.nativeQuote === false) return { kind: 'token', unit: 'ERC-20', address: '', decimals: null };
+  if (same(address, ZERO_ADDRESS) && status.nativeQuote !== false) return { kind: 'native', unit: 'BNB', decimals: 18 };
+  return { kind: 'unknown' };
+}
+function catalogQuoteAmount(value, quote) {
+  if (value === null || quote.decimals == null) return '—';
+  return (quote.decimals === 0 ? value.toString() : formatUnits(value, quote.decimals)) + ' ' + quote.unit;
+}
 function catalogQuery(value) { return String(value ?? '').normalize('NFKC').trim().toLowerCase(); }
 function catalogMatches(row, query) {
   if (!query) return true;
@@ -1385,15 +1409,15 @@ function paintCatalogMetadata(node, key) {
     node.setAttribute('aria-label', exact);
   }
 }
-function catalogStat(label, value) {
+function catalogStat(label, value, detail = '') {
   const group = element('div', 'catalog-stat');
   const amount = element('dd', '', value);
-  amount.title = value;
+  amount.title = detail ? (value === '—' ? detail : value + ' · ' + detail) : value;
   group.append(element('dt', '', label), amount);
   return group;
 }
 function catalogCard(row, display) {
-  const { key, view, kind, title, tone, mode, mintIndex, hasSnipe, disabled, fundingPhase, now } = display;
+  const { key, view, kind, title, tone, mode, mintIndex, hasSnipe, disabled, fundingPhase, now, quote, stale } = display;
   const card = element('article', 'catalog-card');
   card.dataset.catalogCard = key;
   card.dataset.catalogUrl = row.url;
@@ -1425,13 +1449,16 @@ function catalogCard(row, display) {
   const price = catalogInteger(view.pricePerLot);
   const goal = catalogInteger(view.totalLots);
   const stats = element('dl', 'catalog-stats');
-  const priceText = price === null ? '—' : formatUnits(price) + ' BNB';
-  const totalText = price === null || goal === null ? '—' : formatUnits(price * goal) + ' BNB';
+  const priceText = catalogQuoteAmount(price, quote);
+  const totalText = catalogQuoteAmount(price === null || goal === null ? null : price * goal, quote);
+  const quoteDetail = quote.kind === 'unknown' ? '支付币种待链上核验' : quote.kind === 'token' ?
+    (quote.decimals === null ? '支付代币小数位待核验' + (quote.address ? '；合约：' + quote.address : '') :
+      '支付代币合约：' + quote.address) : '';
   const supply = catalogStat('初始总供应', '—');
   const supplyValue = supply.querySelector('dd');
   supplyValue.dataset.catalogSupply = key;
   paintCatalogMetadata(supplyValue, key);
-  stats.append(catalogStat('Mint 单批', priceText), catalogStat('Mint 目标金额', totalText), supply);
+  stats.append(catalogStat('Mint 单批', priceText, quoteDetail), catalogStat('Mint 目标金额', totalText, quoteDetail), supply);
   const progress = element('div', 'catalog-progress');
   const percentage = catalogProgress(view);
   const bought = catalogInteger(view.mintedLots);
@@ -1445,6 +1472,7 @@ function catalogCard(row, display) {
   gauge.setAttribute('aria-label', percentage === null ? '筹资进度尚未读取' : '筹资进度');
   if (percentage === null) gauge.classList.add('unknown');
   progress.append(gauge, details);
+  if (stale) progress.append(element('p', 'catalog-action-note', '链上状态暂未更新 · 显示上次快照'));
   const lower = element('div', 'catalog-card-foot');
   const deadline = catalogTimestamp(view.fundingDeadline);
   const timing = element('div', 'catalog-timing');
@@ -1461,6 +1489,14 @@ function catalogCard(row, display) {
   lower.append(timing);
   if (mode) lower.append(badge(mode, mode === '公开 Mint' ? 'green' : 'amber'));
   const actions = element('div', 'catalog-actions');
+  if (quote.kind !== 'native') {
+    const note = quote.kind === 'token' ? quote.unit + ' 代币支付 · 仅供查看' : '支付币种待核验 · 暂不可操作';
+    const readOnly = element('p', 'catalog-action-note', note);
+    if (quote.kind === 'token') readOnly.title = '本工具只支持 BNB 支付项目的 Mint、领币和狙击。';
+    actions.append(readOnly);
+    card.append(head, description, stats, progress, lower, actions);
+    return card;
+  }
   const mint = element('button', 'btn primary compact');
   mint.type = 'button';
   mint.dataset.catalogAction = 'mint';
@@ -1487,7 +1523,7 @@ function updateCatalogCards(list, entries, now) {
   const disabled = !state.config || frozen();
   const old = new Map(Array.from(list.children, node => [node.dataset.catalogCard, node]));
   catalog.fundingRows.clear();
-  const next = entries.map(({ row, key, live, phase }) => {
+  const next = entries.map(({ row, key, live, phase, failed }) => {
     const view = live && !live.error ? { ...row, ...live } : row;
     const [kind, title, tone] = phase;
     const deadline = catalogTimestamp(view.fundingDeadline);
@@ -1497,13 +1533,16 @@ function updateCatalogCards(list, entries, now) {
       view.whitelistEnabled && catalogTimestamp(view.whitelistDeadline) > now ? '白名单期' : '公开 Mint';
     const mintIndex = mint.indexOf(key);
     const hasSnipe = snipe.has(key);
+    const quote = catalogQuote(live);
+    const stale = Boolean(failed && live && !live.error);
     const previous = old.get(key);
     old.delete(key);
     // Ignore new block numbers when no data shown on the card changed.
     const version = JSON.stringify([row.url, kind, title, mode, view.mintedLots, view.totalLots,
-      view.pricePerLot, view.fundingDeadline, mintIndex, hasSnipe, disabled, fundingPhase, row.createdAt]);
+      view.pricePerLot, view.fundingDeadline, mintIndex, hasSnipe, disabled, fundingPhase, row.createdAt,
+      quote.kind, quote.unit, quote.address, quote.decimals, stale]);
     if (previous?.dataset.catalogVersion === version) return previous;
-    const card = catalogCard(row, { key, view, kind, title, tone, mode, mintIndex, hasSnipe, disabled, fundingPhase, now });
+    const card = catalogCard(row, { key, view, kind, title, tone, mode, mintIndex, hasSnipe, disabled, fundingPhase, now, quote, stale });
     card.dataset.catalogVersion = version;
     if (previous) {
       const focused = previous.contains(document.activeElement) && document.activeElement.dataset.catalogAction;
@@ -1541,13 +1580,14 @@ function paintDiscover() {
     if (!catalogMatches(row, catalog.query)) continue;
     const key = projectKey(row);
     const live = catalog.statuses.get(key);
-    const phase = catalogPhase(live, now);
+    const failed = catalog.statusFailures.has(key);
+    const phase = catalogPhase(live, now, failed);
     const [kind] = phase;
     if (catalog.filter !== 'all' &&
         !(catalog.filter === 'funding' ? ['funding', 'ending'].includes(kind) : catalog.filter === kind)) continue;
     const sortKey = catalog.sort === 'progress' ? -(catalogProgress(live) ?? -1) :
       catalog.sort === 'ending' && ['funding', 'ending', 'funded'].includes(kind) ? catalogTimestamp(live?.fundingDeadline) || Infinity : Infinity;
-    entries.push({ row, key, live, phase, sortKey });
+    entries.push({ row, key, live, phase, sortKey, failed });
   }
   if (catalog.sort !== 'latest') entries.sort((a, b) => a.sortKey === b.sortKey ? 0 : a.sortKey < b.sortKey ? -1 : 1);
   const exact = validAddress(catalog.query);
@@ -1664,6 +1704,8 @@ function catalogStatusRows(page) {
   const now = Date.now();
   const eligible = row => {
     const key = projectKey(row);
+    const failure = catalog.statusFailures.get(key);
+    if (failure) return now >= failure.retryAt;
     const status = catalog.statuses.get(key);
     // A local deadline is not proof of a terminal on-chain state. Keep
     // checking sold-out Mints until the contract confirms launch.
@@ -1685,33 +1727,47 @@ function catalogStatusRows(page) {
   }
   return [...rows.values()];
 }
-async function loadCatalogStatus(rows) {
-  if (!rows.length || !catalogVisible()) return true;
-  if (catalog.reading) return true;
+function markCatalogStatusFailure(key, now) {
+  const attempts = Math.min((catalog.statusFailures.get(key)?.attempts ?? 0) + 1, 4);
+  const delay = Math.min(CATALOG_STATUS_RETRY_MAX_MS, CATALOG_REFRESH_MS * 2 ** attempts);
+  boundedSet(catalog.statusFailures, key, { attempts, retryAt: now + delay }, 2048);
+}
+async function loadCatalogStatus(rows, { isolated = false } = {}) {
+  if (!rows.length || !catalogVisible() || catalog.reading) return !catalog.statusError;
   catalog.reading = true;
+  const pending = new Set(rows.map(projectKey));
+  const count = pending.size;
+  let latest = 0;
   try {
     const d = await api('catalog/status', { urls: rows.map(row => row.url) });
-    const pending = new Set(rows.map(projectKey));
-    const count = pending.size;
-    for (const row of d.projects ?? []) {
+    if (!Array.isArray(d.projects)) throw new Error('项目状态返回格式不正确。');
+    for (const row of d.projects) {
       const key = projectKey(row ?? {});
       if (!pending.has(key)) continue;
       const old = catalog.statuses.get(key);
-      if (row.error) {
-        if (!old) catalog.statuses.set(key, row);
-        continue;
-      }
-      if (typeof row.launched !== 'boolean' || Number(row.block ?? 0) < Number(old?.block ?? 0)) continue;
+      const block = Number(row.block ?? 0);
+      if (row.error || typeof row.launched !== 'boolean' || !Number.isSafeInteger(block) ||
+          block < 1 || block < Number(old?.block ?? 0)) continue;
       catalog.statuses.set(key, row);
       catalog.statusReadAt.set(key, Date.now());
+      catalog.statusFailures.delete(key);
       pending.delete(key);
+      latest = Math.max(latest, block);
     }
-    catalog.statusError = pending.size ? '部分链上状态暂未同步，已保留可用快照。' : '';
-    return pending.size < count;
+    if (!isolated && latest) {
+      catalog.lastUpdated = Date.now();
+      catalog.lastBlock = Math.max(catalog.lastBlock ?? 0, latest);
+    }
+    // A broken or unsupported row shouldn't make a healthy board look offline.
+    if (!isolated) catalog.statusError = pending.size >= 3 && pending.size / count >= 0.75 ?
+      '多数项目状态暂未同步，已保留可用快照，将自动重试。' : '';
+    return isolated ? pending.size === 0 : !catalog.statusError;
   } catch (e) {
-    catalog.statusError = '链上状态暂未同步，已保留可用快照。' + e.message;
-    return false;
+    if (!isolated && count >= 3) catalog.statusError = '链上状态暂未同步，已保留可用快照。' + e.message;
+    return !isolated && !catalog.statusError;
   } finally {
+    const now = Date.now();
+    for (const key of pending) markCatalogStatusFailure(key, now);
     catalog.reading = false;
     renderDiscover();
   }
@@ -1782,10 +1838,6 @@ async function loadCatalog({ more = false } = {}) {
       catalog.pendingMetadata.clear();
       renderDiscover();
       updated = await loadCatalogStatus(catalogStatusRows(page));
-      if (updated && !more) {
-        catalog.lastUpdated = Date.now();
-        catalog.lastBlock = catalog.headBlock;
-      }
     }
   } catch (e) { catalog.error = '代币目录未更新。' + e.message; }
   finally {
@@ -1819,7 +1871,9 @@ async function resolveCatalogAddress(query) {
     if (project) {
       if (catalogVisible()) {
         queueMetadata([project]);
-        if (!catalog.busy && !catalog.reading) await loadCatalogStatus([project]);
+        if (!catalog.busy && !catalog.reading && Date.now() >= (catalog.statusFailures.get(projectKey(project))?.retryAt ?? 0)) {
+          await loadCatalogStatus([project], { isolated: true });
+        }
       }
     }
   } catch (e) { boundedSet(catalog.lookups, query, { error: '完整地址查询失败：' + e.message }, 64); }

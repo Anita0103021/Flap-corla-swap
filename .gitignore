@@ -7,7 +7,6 @@ state/
 reports/
 *.sqlite
 *.sqlite-*
-
 *.dpapi
 *.ndjson
 *.log

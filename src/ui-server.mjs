@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { formatEther } from 'ethers';
+import { formatEther, ZeroAddress } from 'ethers';
 import { CHAIN_ID, address, checkBudget, int, mintWalletsFor, parseMintLink, readJson, snipeTargetUrls, validateConfig } from './config.mjs';
 import { inspectMint, inspectParticipant } from './corla.mjs';
 import { discoverProjects } from './events.mjs';
@@ -16,7 +16,7 @@ import { createWalletVault } from './wallet-vault.mjs';
 import { createLocalWalletUnlock } from './local-wallet-unlock.mjs';
 import { makeFastSnipe, prepareSnipe, snipeWsUrl } from './snipe.mjs';
 import { createSnipeReceiptObserver, createSnipeRunRecorder } from './snipe-run-recorder.mjs';
-import { readDashboardParticipants, readDashboardProjects, readDashboardWalletBalances } from './dashboard-chain.mjs';
+import { readCatalogQuoteMetadata, readDashboardParticipants, readDashboardProjects, readDashboardWalletBalances } from './dashboard-chain.mjs';
 import { createProjectMetadata } from './project-metadata.mjs';
 import { findCatalogAddress, readCatalogPage } from './catalog.mjs';
 import { readCatalogFundingTimes } from './catalog-funding.mjs';
@@ -152,7 +152,7 @@ export async function createUiServer({
     diskConfig[key] === undefined ? [] : [[key, diskConfig[key]]]));
   const svc = { createRpcPool, inspectMint, inspectParticipant, discoverProjects, createWalletVault, createLocalWalletUnlock, makeExecutor,
     makeMonitor, makeFastSnipe, prepareSnipe, readDashboardProjects, readDashboardParticipants, readDashboardWalletBalances,
-    createProjectMetadata, readCatalogPage, findCatalogAddress, readCatalogFundingTimes, createNotificationFeed, ...services };
+    createProjectMetadata, readCatalogPage, findCatalogAddress, readCatalogFundingTimes, readCatalogQuoteMetadata, createNotificationFeed, ...services };
   const vault = await svc.createWalletVault(join(root, 'state', 'wallet-vault.json'));
   const localUnlock = svc.createLocalWalletUnlock(join(root, 'state', 'wallet-unlock.dpapi'));
   const metadata = svc.createProjectMetadata();
@@ -183,6 +183,9 @@ export async function createUiServer({
   const catalogPages = new Map();
   const catalogJobs = new Map();
   const catalogStatusCache = new Map();
+  const catalogQuoteCache = new Map();
+  const catalogQuoteJobs = new Map();
+  let catalogQuoteBatches = 0;
   const catalogAddresses = new Map();
   const catalogLookups = new Map();
   const catalogFundingSnapshots = new Map();
@@ -320,7 +323,7 @@ export async function createUiServer({
     if (summaryJobs.size >= 4) throw new HttpError(409, '项目刷新请求过多，请稍后再试');
     const work = (async () => {
       const provider = await dashboardProvider(cfg);
-      const read = await svc.readDashboardProjects(provider, cfg.targets, 'latest');
+      const read = await svc.readDashboardProjects(provider, cfg.targets, 'latest', { allowTokenQuote: cfg.workspace === 'catalog' && !remember });
       return cfg.targets.map(target => {
         const chain = read.get(target.mint.toLowerCase()) ?? { error: '未读到项目合约状态' };
         const block = chain.blockNumber;
@@ -376,6 +379,65 @@ export async function createUiServer({
     catalogLookups.set(key, work);
     try { return await work; } finally { catalogLookups.delete(key); }
   }
+  async function catalogQuotes(cfg, rows) {
+    const byBlock = new Map();
+    const work = new Set();
+    const included = new Set();
+    const clock = performance.now();
+    for (const row of rows) {
+      if (row.error || !row.quoteToken || row.quoteToken === ZeroAddress || !Number.isSafeInteger(row.block) || row.block < 1) continue;
+      const token = row.quoteToken.toLowerCase();
+      if (included.has(token)) continue;
+      included.add(token);
+      if ((catalogQuoteCache.get(token)?.until ?? 0) > clock) continue;
+      const existing = catalogQuoteJobs.get(token);
+      if (existing) work.add(existing);
+      else {
+        if (!byBlock.has(row.block)) byBlock.set(row.block, []);
+        byBlock.get(row.block).push(token);
+      }
+    }
+    for (const [block, tokens] of byBlock) {
+      if (catalogQuoteBatches >= 2) break;
+      catalogQuoteBatches++;
+      const job = (async () => {
+        try {
+          const provider = await dashboardProvider(cfg);
+          const result = await svc.readCatalogQuoteMetadata(provider, tokens, block);
+          for (const token of tokens) {
+            const { quoteDecimals = null, quoteSymbol = null } = result.get(token) ?? {};
+            remember(catalogQuoteCache, token, { quoteDecimals, quoteSymbol, until: performance.now() +
+              (quoteDecimals !== null && quoteSymbol !== null ? 600_000 : 30_000) }, 512);
+          }
+        } catch {
+          for (const token of tokens) {
+            const previous = catalogQuoteCache.get(token);
+            remember(catalogQuoteCache, token, { quoteDecimals: previous?.quoteDecimals ?? null,
+              quoteSymbol: previous?.quoteSymbol ?? null, until: performance.now() + 30_000 }, 512);
+          }
+        } finally {
+          catalogQuoteBatches--;
+          for (const token of tokens) catalogQuoteJobs.delete(token);
+        }
+      })();
+      for (const token of tokens) catalogQuoteJobs.set(token, job);
+      work.add(job);
+    }
+    if (work.size) {
+      // Give the normal one-call enrichment a chance, but a slow quote token
+      // must not hold the rest of the catalog hostage. Its result is cached
+      // for the next read even if the metadata deadline wins this response.
+      let timer;
+      try { await Promise.race([Promise.all(work), new Promise(done => { timer = setTimeout(done, 1000); })]); }
+      finally { clearTimeout(timer); }
+    }
+    return rows.map(row => {
+      if (row.error || !row.quoteToken) return row;
+      if (row.quoteToken === ZeroAddress) return { ...row, nativeQuote: true, quoteSymbol: 'BNB', quoteDecimals: 18 };
+      const meta = catalogQuoteCache.get(row.quoteToken.toLowerCase());
+      return { ...row, nativeQuote: false, quoteSymbol: meta?.quoteSymbol ?? null, quoteDecimals: meta?.quoteDecimals ?? null };
+    });
+  }
   async function catalogStatus(urls) {
     if (!Array.isArray(urls) || urls.length > 32) throw new HttpError(400, '看板状态每批最多 32 个项目');
     const byMint = new Map();
@@ -394,20 +456,17 @@ export async function createUiServer({
     if (cached && performance.now() - cached.at < 650) return cached.rows;
     // Browsing the catalog must never add projects to the active workspaces or
     // fill /api/state with dozens of untracked cards.
-    const rows = await summaryStatus({ ...checked(undefined, 'mint'), workspace: 'catalog', targets },
-      { remember: false });
+    const cfg = { ...checked(undefined, 'mint'), workspace: 'catalog', targets };
+    const rows = await summaryStatus(cfg, { remember: false });
     for (const row of rows) {
       if (row.error || !Number.isSafeInteger(row.block) || row.block < 1) continue;
       const id = fundingKey(row);
       const previous = catalogFundingSnapshots.get(id);
       if (!previous || row.block >= previous.block) remember(catalogFundingSnapshots, id, row, 1024);
     }
-    if (rows.every(row => !row.error)) {
-      catalogStatusCache.delete(key);
-      catalogStatusCache.set(key, { at: performance.now(), rows });
-      if (catalogStatusCache.size > 48) catalogStatusCache.delete(catalogStatusCache.keys().next().value);
-    }
-    return rows;
+    const enriched = await catalogQuotes(cfg, rows);
+    remember(catalogStatusCache, key, { at: performance.now(), rows: enriched }, 48);
+    return enriched;
   }
   function currentFundingRecord(id) {
     const snapshot = catalogFundingSnapshots.get(id);

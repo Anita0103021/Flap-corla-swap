@@ -4,6 +4,7 @@ import { copyFile, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
+import { ZeroAddress } from 'ethers';
 import { parseMintLink } from '../src/config.mjs';
 import { createUiServer } from '../src/ui-server.mjs';
 
@@ -23,6 +24,8 @@ test('token board pages and status stay read-only, isolated and cached', async t
   let pageCalls = 0;
   let resolves = 0;
   let statusReads = 0;
+  let quoteReads = 0;
+  const quote = '0x' + 'ab'.repeat(20);
   let addresses;
   app = await createUiServer({ rootDir, services: {
     makeProvider: () => ({ getNetwork: async () => ({ chainId: 56n }), destroy() {} }),
@@ -35,12 +38,22 @@ test('token board pages and status stay read-only, isolated and cached', async t
       resolves++;
       return addresses.find(row => row.token === address || row.mint === address) ?? null;
     },
-    readDashboardProjects: async (_provider, targets, blockTag) => {
+    readDashboardProjects: async (_provider, targets, blockTag, { allowTokenQuote } = {}) => {
       statusReads++;
       assert.equal(blockTag, 'latest');
       return new Map(targets.map(target => [target.mint.toLowerCase(), {
-        blockNumber: 9000, pricePerLot: 100000000000000000n, mintedLots: 12n, totalLots: 50n, launched: false,
+        blockNumber: 9000,
+        ...(target.mint === addresses[1].mint && !allowTokenQuote ? { error: '仅支持使用 BNB 支付的 Corla Mint' } : {
+          quoteToken: target.mint === addresses[0].mint ? ZeroAddress : quote,
+          pricePerLot: 100000000000000000n, mintedLots: 12n, totalLots: 50n, launched: false,
+        }),
       }]));
+    },
+    readCatalogQuoteMetadata: async (_provider, tokens, at) => {
+      quoteReads++;
+      assert.deepEqual(tokens, [quote]);
+      assert.equal(at, 9000);
+      return new Map([[quote, { quoteSymbol: 'QUOTE', quoteDecimals: 6 }]]);
     },
     makeExecutor: () => assert.fail('catalog must not start an executor'),
   } });
@@ -67,8 +80,12 @@ test('token board pages and status stay read-only, isolated and cached', async t
   const rows = (await status.json()).projects;
   assert.deepEqual(rows.map(row => row.block), [9000, 9000]);
   assert.deepEqual(rows.map(row => row.mintedLots), ['12', '12']);
+  assert.deepEqual(rows.map(({ nativeQuote, quoteSymbol, quoteDecimals }) => [nativeQuote, quoteSymbol, quoteDecimals]),
+    [[true, 'BNB', 18], [false, 'QUOTE', 6]]);
   assert.deepEqual((await (await post('/api/catalog/status', { urls: addresses.map(row => row.url) })).json()).projects, rows);
   assert.equal(statusReads, 1, 'near-simultaneous tabs share a successful catalog snapshot');
+  assert.equal((await post('/api/catalog/status', { urls: [addresses[1].url] })).status, 200);
+  assert.equal(quoteReads, 1, 'quote metadata is cached across different card batches');
   assert.equal((await post('/api/catalog/status', { urls: ['https://example.com/token'] })).status, 400);
   assert.equal((await post('/api/catalog', { limit: 33 })).status, 400);
   assert.equal((await post('/api/catalog', { limit: 1 }, { origin: 'https://external.invalid' })).status, 403);
@@ -76,6 +93,8 @@ test('token board pages and status stay read-only, isolated and cached', async t
   const active = await get('/api/state');
   assert.deepEqual(active.projects, []);
   assert.equal(active.running, false);
+  const strict = await (await post('/api/status', { workspace: 'mint', summaryOnly: true })).json();
+  assert.match(strict.projects.find(row => row.mint === addresses[1].mint)?.error, /仅支持使用 BNB/);
   const time = Date.now() + 1500;
   t.mock.method(Date, 'now', () => time);
   assert.equal((await post('/api/catalog', { limit: 1 })).status, 200);
