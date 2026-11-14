@@ -45,6 +45,24 @@ test('claim-only and already launched projects reserve gas only for an unclaimed
   assert.deepEqual(picker({ wallet, project: launched, autoClaim: false }), { status: 'idle', needWei: 0n });
 });
 
+test('ERC-20 Mint qualifies the quote balance and BNB gas separately', () => {
+  const project = { ...active, quoteToken: '0x0000000000000000000000000000000000000001',
+    quoteDecimals: 6, pricePerLot: '35000000' };
+  const wallet = { balanceWei: gas * 3n, mintedLots: 0n, hasUnclaimedShare: false,
+    quoteBalance: 35_000_000n, quoteAllowance: 0n };
+  assert.deepEqual(picker({ project, wallet }), {
+    status: 'sufficient', needWei: 3n * gas, needQuote: 35_000_000n, approvalNeeded: true,
+  });
+  const funding = changes => picker({ project, wallet: { ...wallet, ...changes } });
+  assert.equal(funding({ quoteBalance: 34_999_999n }).status, 'insufficient');
+  assert.equal(funding({ quoteBalance: null }).status, 'unknown');
+  assert.equal(funding({ balanceWei: 2n * gas }).status, 'insufficient');
+  assert.equal(funding({ quoteAllowance: 1n }).needWei, 4n * gas);
+  assert.deepEqual(funding({ quoteAllowance: 35_000_000n }), {
+    status: 'sufficient', needWei: 2n * gas, needQuote: 35_000_000n, approvalNeeded: false,
+  });
+});
+
 test('withdrawn, expired, and disabled plans are not selected; temporary whitelist is not excluded', () => {
   const wallet = { balanceWei: BNB, mintedLots: '1', hasUnclaimedShare: true };
   assert.deepEqual(picker({ wallet, project: { ...active, phase: '2' } }), { status: 'idle', needWei: 0n });
@@ -60,7 +78,7 @@ test('unknown RPC, participant, project, or gas data never qualifies a wallet', 
     { wallet: { balanceWei: BNB } }, { wallet: { balanceWei: BNB }, batches: 0 },
     { project: null }, { project: { ...active, pricePerLot: '0' } },
     { project: { ...active, mintedLots: '101' } }, { project: { ...active, maxMintsPerWallet: null } },
-    { project: { ...active, phase: 4 } }, { gasWei: 0n }, { batches: 33 }, { batches: '1.5' },
+    { project: { ...active, phase: 7 } }, { gasWei: 0n }, { batches: 33 }, { batches: '1.5' },
   ]) assert.deepEqual(picker(changes), { status: 'unknown', needWei: null });
 });
 

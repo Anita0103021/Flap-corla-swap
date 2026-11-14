@@ -1,5 +1,8 @@
 const PUBLIC_NODE = 'https://bsc-rpc.publicnode.com';
 const BNB_OFFICIAL = 'https://bsc-dataseed.bnbchain.org';
+const MAX_BACKUP_URLS = 7;
+export const MAX_BROADCAST_CONCURRENCY = 1 + MAX_BACKUP_URLS;
+export const LOW_LATENCY_RPC_TIMEOUT_MS = 2_200;
 export const DEFAULT_BSC_RPC_URL = PUBLIC_NODE;
 export const BUILTIN_RPC_URLS = Object.freeze([
   BNB_OFFICIAL,
@@ -27,7 +30,7 @@ export function validateRpcUrl(value, label = 'BSC RPC') {
 }
 
 export function validateRpcBackupUrls(value, label = 'rpcBackupUrls') {
-  if (!Array.isArray(value) || value.length > 7) throw new Error(label + ' 必须是至多 7 个 RPC URL 的数组');
+  if (!Array.isArray(value) || value.length > MAX_BACKUP_URLS) throw new Error(label + ' 必须是至多 7 个 RPC URL 的数组');
   return [...new Set(value.map(url => validateRpcUrl(url, label)))];
 }
 

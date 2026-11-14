@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseEther, Interface } from 'ethers';
-import { buildBuy, marketLimits, readMarket, v2Output, verifyRoundTrip, PANCAKE_FACTORY, ROUTER, WBNB } from '../src/market.mjs';
+import { buildBuy, marketLimits, readMarket, v2Output, verifyRoundTrip, PANCAKE_FACTORY, ROUTER, ROUTER_ABI, WBNB } from '../src/market.mjs';
+import { QUOTE_ERC20 } from '../src/quote-assets.mjs';
 
 const settings = { amountIn: parseEther('0.01'), minLiquidity: parseEther('1'), maxBuyTaxBps: 500,
   maxSellTaxBps: 500, maxPriceImpactBps: 150, slippageBps: 150, deadlineSeconds: 12 };
@@ -119,4 +120,53 @@ test('prebuilt buy must exactly match the round-trip simulation before any RPC',
   assert.equal(simulated, 0);
   assert.deepEqual(await verifyRoundTrip(rpc, market, wallet, settings, block, { buyTx }), buyTx);
   assert.equal(simulated, 1);
+});
+
+test('ERC-20 round trip requires the exact payment in and both simulated payouts', async () => {
+  const quoteToken = '0x0000000000000000000000000000000000000088';
+  const trade = { ...settings, quoteToken, quoteDecimals: 6, amountIn: 25_000_000n, minLiquidity: 200_000_000n };
+  const market = { path: [quoteToken, target], pair, amountOutMin: 100n, reverseMin: 20_000_000n };
+  const block = { number: 100, timestamp: 1000 };
+  const selector = 'swapExactTokensForTokensSupportingFeeOnTransferTokens';
+  const moved = (address, from, to, value) => ({ address, ...QUOTE_ERC20.encodeEventLog('Transfer', [from, to, value]) });
+  let pay = trade.amountIn, quoteOut = market.reverseMin, allowed = trade.amountIn;
+  let simulations = 0;
+  const rpc = {
+    async call({ to, blockTag, data }) {
+      assert.equal(to, quoteToken);
+      assert.equal(blockTag, block.number);
+      const { name, args } = QUOTE_ERC20.parseTransaction({ data });
+      assert.equal(args[0], wallet);
+      if (name === 'allowance') assert.equal(args[1], ROUTER);
+      return QUOTE_ERC20.encodeFunctionResult(name, [name === 'allowance' ? allowed : trade.amountIn]);
+    },
+    async send(method, params) {
+      simulations++;
+      assert.equal(method, 'eth_simulateV1');
+      const { calls, stateOverrides } = params[0].blockStateCalls[0];
+      assert.equal(stateOverrides, undefined);
+      assert.equal(calls[0].value, '0x0');
+      assert.deepEqual([...ROUTER_ABI.decodeFunctionData(selector, calls[0].data)].slice(0, 2), [trade.amountIn, market.amountOutMin]);
+      const [amt, min, path, recipient] = ROUTER_ABI.decodeFunctionData(selector, calls[2].data);
+      assert.equal(amt, market.amountOutMin);
+      assert.equal(min, market.reverseMin);
+      assert.deepEqual([...path], [target, quoteToken]);
+      assert.equal(recipient, wallet);
+      return [{ calls: [
+        { status: '0x1', logs: [moved(quoteToken, wallet, pair, pay), moved(target, pair, wallet, market.amountOutMin)] },
+        { status: '0x1' }, { status: '0x1', logs: [moved(quoteToken, pair, wallet, quoteOut)] },
+      ] }];
+    },
+  };
+  const tx = await verifyRoundTrip(rpc, market, wallet, trade, block);
+  assert.equal(tx.to, ROUTER);
+  assert.equal(tx.value, 0n);
+  pay--;
+  await assert.rejects(verifyRoundTrip(rpc, market, wallet, trade, block), /实际扣款或买卖到账/);
+  pay++;
+  quoteOut--;
+  await assert.rejects(verifyRoundTrip(rpc, market, wallet, trade, block), /实际扣款或买卖到账/);
+  allowed = 0n;
+  await assert.rejects(verifyRoundTrip(rpc, market, wallet, trade, block), /额度不足/);
+  assert.equal(simulations, 3);
 });

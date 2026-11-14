@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, open, realpath } from 'node:fs/promises';
-import { isAbsolute, join, relative, sep } from 'node:path';
-import { Interface } from 'ethers';
+import { mkdir, open, readdir, realpath } from 'node:fs/promises';
+import { isAbsolute, join, relative } from 'node:path';
+import { Interface, ZeroAddress } from 'ethers';
 import { CORLA_LAUNCH_TOPIC } from './events.mjs';
 import { WBNB } from './market.mjs';
+import { quoteAsset } from './quote-assets.mjs';
 
 const EVENTS = new Set([
   'watch_started', 'watch_stopped', 'watch_error', 'project', 'project_error', 'rpc_error', 'journal',
@@ -12,7 +13,8 @@ const EVENTS = new Set([
   'snipe_receipt', 'snipe_launch_index', 'snipe_first_buy', 'buy', 'buy_skipped',
 ]);
 const NUMBERS = [
-  'attempt', 'maxAttempts', 'raceAttempts', 'walletCount', 'chainId', 'block', 'blockNumber', 'armBlock',
+  'attempt', 'maxAttempts', 'raceAttempts', 'repeatAttempts', 'broadcastConcurrency', 'broadcastRpcCount',
+  'walletCount', 'chainId', 'block', 'blockNumber', 'armBlock',
   'launchBlock', 'seenBlock', 'receiptBlock', 'quoteBlock', 'parentBlock', 'lastBlock', 'launchIndex',
   'receiptIndex', 'transactionIndex', 'scanToBlock', 'scanMs', 'windowBlocks', 'deadlineSeconds',
   'preopenLots', 'slippageBps', 'maxOpeningPremiumBps', 'maxPriceImpactBps', 'maxBuyTaxBps', 'maxSellTaxBps', 'phase',
@@ -26,7 +28,7 @@ const TIMINGS = [
 ];
 const QUANTITIES = [
   'amountIn', 'amountOutMin', 'quoted', 'openingNetOut', 'quotedNetOut', 'openingAmountOutMin', 'gasEstimate', 'gasUsed', 'gasLimit', 'gasPrice',
-  'effectiveGasPrice', 'maxGasPriceWei', 'gasLimitCap', 'maxTotalWei', 'reserveBnb',
+  'effectiveGasPrice', 'maxGasPriceWei', 'gasLimitCap', 'maxTotalWei', 'reserveBnb', 'reserveQuote',
   'minLiquidity', 'pricePerLot', 'mintedLots', 'totalLots', 'batches', 'raceGasCap',
 ];
 const HASHES = ['txHash', 'launchTx', 'launchTxHash', 'pendingTxHash', 'blockHash', 'receiptBlockHash', 'parentHash'];
@@ -56,6 +58,39 @@ const low = value => typeof value === 'string' ? value.toLowerCase() : '';
 const int = value => Number.isSafeInteger(value) && value >= 0;
 const same = (a, b) => !!low(a) && low(a) === low(b);
 const round = value => Math.round(value * 1000) / 1000;
+const REPORT_NAME = /^snipe-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{10}\.ndjson$/;
+const reportPathFor = name => 'reports/snipe-runs/' + name;
+
+async function reportDirectory(rootDir, create = false) {
+  let parent = await realpath(rootDir);
+  for (const child of ['reports', 'snipe-runs']) {
+    const requested = join(parent, child);
+    if (create) await mkdir(requested, { mode: 0o700 }).catch(error => {
+      if (error.code !== 'EEXIST') throw error;
+    });
+    const dir = await realpath(requested);
+    const within = relative(parent, dir);
+    if ((process.platform === 'win32' ? within.toLowerCase() : within) !== child || isAbsolute(within)) {
+      throw new Error('Report directory escaped workspace');
+    }
+    parent = dir;
+  }
+  return parent;
+}
+
+export async function findLatestSnipeReport(rootDir) {
+  try {
+    const dir = await reportDirectory(rootDir);
+    let latest;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      if (entry.isFile() && REPORT_NAME.test(entry.name) && (!latest || entry.name > latest)) latest = entry.name;
+    }
+    return latest ? reportPathFor(latest) : null;
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
 function quantity(value) {
   if (typeof value === 'bigint') {
@@ -97,7 +132,11 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
   if (!fields || typeof fields !== 'object') return result;
   if (allowedMints.has(low(fields.mint))) result.mint = low(fields.mint);
   if (allowedTokens.has(low(fields.token))) result.token = low(fields.token);
+  if (isAddress(fields.quoteToken) && allowedTokens.has(low(fields.token))) result.quoteToken = low(fields.quoteToken);
   for (const key of NUMBERS) if (int(fields[key])) result[key] = fields[key];
+  if (int(fields.pendingReceivedAtMs) && fields.pendingReceivedAtMs <= 8_640_000_000_000_000) {
+    result.pendingReceivedAtMs = fields.pendingReceivedAtMs;
+  }
   if (Number.isSafeInteger(fields.blockOffset)) result.blockOffset = fields.blockOffset;
   for (const key of TIMINGS) {
     const value = fields[key];
@@ -132,7 +171,7 @@ export async function createSnipeRunRecorder({
   rootDir, settings = {}, targets = [], armBlock, maxEvents = 20_000, maxQueueBytes = 1024 * 1024,
 } = {}) {
   if (typeof rootDir !== 'string' || !rootDir || !Array.isArray(targets) || targets.length > 32 ||
-      !int(armBlock) || !int(maxEvents) || maxEvents < 1 || maxEvents > 100_000 ||
+      (armBlock !== undefined && !int(armBlock)) || !int(maxEvents) || maxEvents < 1 || maxEvents > 100_000 ||
       !int(maxQueueBytes) || maxQueueBytes < 512 || maxQueueBytes > 16 * 1024 * 1024) {
     throw new Error('狙击记录参数无效');
   }
@@ -142,24 +181,10 @@ export async function createSnipeRunRecorder({
   const tokens = new Set(selected.map(target => target.token));
   const ts = new Date().toISOString();
   const fileName = 'snipe-' + ts.replace(/[:.]/g, '-') + '-' + randomBytes(5).toString('hex') + '.ndjson';
-  const reportPath = 'reports/snipe-runs/' + fileName;
+  const reportPath = reportPathFor(fileName);
   let file;
   try {
-    const root = await realpath(rootDir);
-    const ensureChild = async (parent, child) => {
-      const requested = join(parent, child);
-      await mkdir(requested, { mode: 0o700 }).catch(error => {
-        if (error.code !== 'EEXIST') throw error;
-      });
-      const dir = await realpath(requested);
-      const within = relative(parent, dir);
-      const canonicalName = process.platform === 'win32' ? within.toLowerCase() : within;
-      if (canonicalName !== child || isAbsolute(within) || within === '..' || within.startsWith('..' + sep)) {
-        throw new Error('Report directory escaped workspace');
-      }
-      return dir;
-    };
-    const dir = await ensureChild(await ensureChild(root, 'reports'), 'snipe-runs');
+    const dir = await reportDirectory(rootDir, true);
     file = await open(join(dir, fileName), 'ax', 0o600);
     await file.writeFile(JSON.stringify({
       event: 'run_start', schemaVersion: 1, sequence: 0, time: ts, runMs: 0,
@@ -201,8 +226,11 @@ export async function createSnipeRunRecorder({
     if (!EVENTS.has(event) || closing) return false;
     if (failed || accepted >= maxEvents) { dropped++; return false; }
     try {
-      const line = JSON.stringify({ event, sequence: accepted + 1, time: new Date().toISOString(),
-        runMs: round(performance.now() - began), ...fieldsFor(fields, mints, tokens) }) + '\n';
+      const row = fieldsFor(fields, mints, tokens);
+      const time = event === 'snipe_pending' && row.pendingReceivedAtMs !== undefined
+        ? new Date(row.pendingReceivedAtMs).toISOString() : new Date().toISOString();
+      const line = JSON.stringify({ event, sequence: accepted + 1, time,
+        runMs: round(performance.now() - began), ...row }) + '\n';
       const size = Buffer.byteLength(line);
       if (bytes + size > maxQueueBytes) { dropped++; return false; }
       bytes += size;
@@ -249,8 +277,10 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
   let running, timer, scheduledAt, stopped = false;
   const active = () => !stopped && !signal?.aborted;
   async function compareFirstBuy({ fields, hash, height, index, launchLog, pool, launchBlockHash }) {
+    const quote = quoteAsset(fields.quoteToken);
+    const asset = quote === ZeroAddress ? WBNB : quote;
     if (!active() || typeof provider.getBlockNumber !== 'function' || typeof provider.getLogs !== 'function' ||
-        !isAddress(pool) || /^0x0{40}$/i.test(pool) || same(fields.token, WBNB) || comparisons >= 2) return;
+        !isAddress(pool) || /^0x0{40}$/i.test(pool) || same(fields.token, asset) || comparisons >= 2) return;
     comparisons++;
     try {
       const head = rpcInt(await provider.getBlockNumber());
@@ -259,8 +289,8 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
       const swaps = await provider.getLogs({ address: pool, topics: [SWAP_TOPIC], fromBlock: height, toBlock: scanToBlock });
       if (!active() || !Array.isArray(swaps) || swaps.length > 512) return;
       // The canonical Pancake V2 factory sorts the pair tokens by address.
-      // Only WBNB-in / target-out swaps can be counted as buys.
-      const wbnbFirst = low(WBNB) < low(fields.token);
+      // Only verified quote-in / target-out swaps count as buys.
+      const quoteFirst = low(asset) < low(fields.token);
       const launchLogIndex = rpcInt(launchLog.index ?? launchLog.logIndex);
       const buys = [];
       for (const swap of swaps) {
@@ -275,8 +305,8 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
         try {
           const row = PAIR_EVENTS.parseLog(swap)?.args;
           if (!row) continue;
-          const amountIn = wbnbFirst ? row.amount0In : row.amount1In;
-          const targetOut = wbnbFirst ? row.amount1Out : row.amount0Out;
+          const amountIn = quoteFirst ? row.amount0In : row.amount1In;
+          const targetOut = quoteFirst ? row.amount1Out : row.amount0Out;
           if (amountIn > 0n && targetOut > 0n) buys.push({ block, txIndex, logIndex, amountIn, swap });
         } catch { /* Discard malformed event data. */ }
       }
@@ -286,7 +316,7 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
         provider.getBlock(height), first && first.block !== height ? provider.getBlock(first.block) : null,
       ]);
       if (!active() || rpcInt(canonicalLaunch?.number) !== height || !same(canonicalLaunch?.hash, launchBlockHash)) return;
-      const context = { token: fields.token, mint: fields.mint, launchTx: hash,
+      const context = { token: fields.token, mint: fields.mint, quoteToken: fields.quoteToken, launchTx: hash,
         launchBlock: height, launchIndex: index, scanToBlock };
       if (!first) { record('snipe_first_buy', { ...context, status: 'no_buy_seen' }); return; }
       const inclusion = first.block === height ? canonicalLaunch : canonicalBuy;
@@ -322,7 +352,7 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
           fields, hash, height, index, launchLog, pool, launchBlockHash: header.hash,
         });
       } else {
-        record('snipe_receipt', { mint: fields.mint, token: fields.token,
+        record('snipe_receipt', { mint: fields.mint, token: fields.token, quoteToken: fields.quoteToken,
           txHash: hash, receiptBlock: height, receiptIndex: index, receiptBlockHash: header.hash,
           launchBlock: fields.launchBlock, ...(int(fields.launchBlock) ? { blockOffset: height - fields.launchBlock } : {}),
           attempt: fields.attempt, status: 'mined', success: status === 1, gasUsed: receipt.gasUsed });
@@ -361,6 +391,7 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
     if (seen.has(key)) return;
     seen.add(key);
     waiting.set(key, { hash, height, fields: { mint: fields.mint, token: fields.token,
+      quoteToken: isAddress(fields.quoteToken) ? fields.quoteToken : undefined,
       launchBlock: fields.launchBlock, attempt: fields.attempt, pool: fields.pool }, launch,
       // Index enrichment cannot help the order and should not compete with
       // the first quote/submit. Receipt enrichment is already post-outcome.

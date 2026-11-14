@@ -1,7 +1,8 @@
 import { inspectMint, buildMint, buildClaim, createCorlaInspectionScope } from './corla.mjs';
 import { findLaunch } from './events.mjs';
-import { applyOpeningPriceGuard, readMarket, readOpeningBuyTax, verifyRoundTrip } from './market.mjs';
-import { MAX_MINT_BATCHES, mintWalletsFor } from './config.mjs';
+import { applyOpeningPriceGuard, readMarket, readOpeningBuyTax, ROUTER, verifyRoundTrip } from './market.mjs';
+import { MAX_MINT_BATCHES, mintWalletsFor, snipeSettingsForTarget } from './config.mjs';
+import { quoteAsset, readQuoteDecimals, requireQuoteFunds } from './quote-assets.mjs';
 
 // Legacy/mock executors may not expose receipt maturity. Limit background
 // checks in that case; the real executor retires entries at canonical depth.
@@ -64,7 +65,7 @@ function projectFingerprint(state) {
   // Exclude the observation height: time/phase-only changes still need to be
   // reported, but unchanged snapshots shouldn't add an event each block.
   return [state.activeLots, state.mintedLots, state.totalLots, state.launched, state.pool, state.token,
-    state.pricePerLot, state.maxMintsPerWallet, state.tokensPerLot, state.phase, state.fundingDeadline,
+    state.quoteToken, state.quoteDecimals, state.pricePerLot, state.maxMintsPerWallet, state.tokensPerLot, state.phase, state.fundingDeadline,
     state.whitelistEnabled, state.whitelistDeadline, state.agentOnly, state.emergencyWithdrawn].join(':');
 }
 export function shortError(e) {
@@ -223,11 +224,15 @@ export function makeMonitor({ provider, cfg, wallets, execute, armBlock, log, si
         if (signal?.aborted) return;
         if (!entry?.target.buyOnLaunch || !entry.state.launched) continue;
         const { target, state } = entry;
+        const trade = snipeSettingsForTarget(cfg.snipe, target);
         const id = actionId('buy', target);
         if (snipeAttempted.has(id)) continue;
-        const launchDetails = { mint: target.mint, token: target.token };
+        const launchDetails = { mint: target.mint, token: target.token,
+          ...(trade.quoteToken ? { quoteToken: trade.quoteToken, amountIn: trade.amountIn } : {}) };
         try {
-          const launch = await svc.findLaunch(provider, target, state, ...bounds);
+          if (quoteAsset(state.quoteToken) !== quoteAsset(trade.quoteToken) ||
+              (target.snipeQuote && state.quoteDecimals !== trade.quoteDecimals)) throw new Error('狙击支付币或精度与配置不同');
+          const launch = await svc.findLaunch(provider, trade.quoteToken ? { ...target, quoteToken: trade.quoteToken } : target, state, ...bounds);
           if (!launch || signal?.aborted || snipeAttempted.has(id)) continue;
           snipeAttempted.add(id);
           Object.assign(launchDetails, { launchBlock: launch.blockNumber, launchTx: launch.txHash });
@@ -239,16 +244,25 @@ export function makeMonitor({ provider, cfg, wallets, execute, armBlock, log, si
             continue;
           }
           const [quote, openingBuyTax] = await Promise.all([
-            svc.readMarket(provider, target, state, cfg.snipe, block),
+            svc.readMarket(provider, target, state, trade, block),
             svc.readOpeningBuyTax(provider, target.token, launch.blockNumber),
           ]);
           if (signal?.aborted) return;
-          const market = applyOpeningPriceGuard(quote, launch.openingReserves, openingBuyTax, cfg.snipe);
+          const market = applyOpeningPriceGuard(quote, launch.openingReserves, openingBuyTax, trade);
           const selected = wallets.slice(0, cfg.snipe.walletCount);
           await Promise.all(selected.map(wallet => action('buy', target, wallet, async () => {
-            const tx = await svc.verifyRoundTrip(provider, market, wallet.address, cfg.snipe, block);
+            const tx = await svc.verifyRoundTrip(provider, market, wallet.address, trade, block);
             return { tx,
-              beforeSign: () => verifyBuySnapshot(provider, { launch, quoteBlock: block, settings: cfg.snipe, armBlock, signal }),
+              beforeSign: async () => {
+                await verifyBuySnapshot(provider, { launch, quoteBlock: block, settings: trade, armBlock, signal });
+                if (trade.quoteToken) {
+                  const [decimals] = await Promise.all([
+                    readQuoteDecimals(provider, trade.quoteToken, 'latest'),
+                    requireQuoteFunds(provider, trade.quoteToken, wallet.address, ROUTER, trade.amountIn, 'latest'),
+                  ]);
+                  if (decimals !== trade.quoteDecimals) throw new Error('买入支付币精度已变化；未发送');
+                }
+              },
               details: { ...launchDetails, pair: market.pair, amountOutMin: market.amountOutMin, quoted: market.quoted,
                 openingNetOut: market.openingNetOut, quotedNetOut: market.quotedNetOut,
                 openingAmountOutMin: market.openingAmountOutMin, maxOpeningPremiumBps: market.maxOpeningPremiumBps },

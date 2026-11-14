@@ -1,8 +1,9 @@
-import { Interface, keccak256 } from 'ethers';
+import { Interface, keccak256, ZeroAddress } from 'ethers';
 import { CHAIN_ID, FACTORY, address } from './config.mjs';
 import { CORLA_ABI, verifySnipeState } from './corla.mjs';
 import { isRpcLimit } from './events.mjs';
 import { PANCAKE_FACTORY, ROUTER, WBNB, marketLimits, readMarket } from './market.mjs';
+import { quoteAsset } from './quote-assets.mjs';
 
 // BSC Multicall3 runtime verified independently at PublicNode and BNB's
 // official HTTP RPC. Do not trust just an address for execution-sensitive reads.
@@ -123,13 +124,17 @@ async function direct(provider, target, pool, settings, block) {
  * wallet-specific simulation, canonical head, nonce and final slippage. */
 export async function readSnipeMarket(provider, target, pool, settings, block) {
   if (!checkedHeight(block?.number)) throw new Error('缺少有效的报价区块');
-  const checked = { mint: address(target?.mint, 'Mint'), token: address(target?.token, 'Token'), factory: FACTORY };
+  const quoteToken = quoteAsset(settings.quoteToken);
+  const native = quoteToken === ZeroAddress;
+  const asset = native ? WBNB : quoteToken;
+  const checked = { mint: address(target?.mint, 'Mint'), token: address(target?.token, 'Token'), factory: FACTORY, quoteToken };
   const pair = address(pool, 'Pool');
-  if (!same(target?.factory, FACTORY) || checked.mint === checked.token) throw new Error('不支持此 Corla 工厂或 Mint 地址');
+  if (!same(target?.factory, FACTORY) || checked.mint === checked.token || checked.token === asset ||
+      (target.quoteToken !== undefined && quoteAsset(target.quoteToken) !== quoteToken)) throw new Error('Corla 工厂、目标或支付币不匹配');
   const mark = modeByProvider.get(provider);
   if (mark?.error) throw mark.error;
   if (!mark?.available || block.number < mark.height) return direct(provider, checked, pair, settings, block);
-  const path = [WBNB, checked.token];
+  const path = [asset, checked.token];
   // These are the same getters as the direct checks. All are read from the
   // exact quote block, before the separate full round-trip trade simulation.
   const reads = [
@@ -146,22 +151,25 @@ export async function readSnipeMarket(provider, target, pool, settings, block) {
     item(pair, PAIR, 'token1'),
     item(pair, PAIR, 'getReserves'),
     item(ROUTER, ROUTER_ABI, 'getAmountsOut', [settings.amountIn, path]),
+    ...(!native ? [item(checked.mint, CORLA_ABI, 'quoteToken')] : []),
   ];
   const result = await aggregate(provider, reads, block.number);
   if (result === null) return direct(provider, checked, pair, settings, block);
   const [[launched], [token], [corlaPool], [implementation], [withdrawn], [mainPool], [factoryPair], [buyTax], [sellTax],
-    [token0], [token1], reserves, [amounts]] = result;
-  if (!launched || withdrawn || !same(token, checked.token) || !same(corlaPool, pair) || !same(implementation, IMPLEMENTATION)) {
+    [token0], [token1], reserves, [amounts], onChainQuote] = result;
+  if (!launched || withdrawn || !same(token, checked.token) || !same(corlaPool, pair) || !same(implementation, IMPLEMENTATION) ||
+      (!native && !same(onChainQuote?.[0], quoteToken))) {
     throw new Error('Corla 当前开盘状态或实现与事件不一致');
   }
   if (!same(mainPool, pair) || !same(factoryPair, pair)) throw new Error('Corla、Token 和 Pancake V2 的交易池不一致');
-  const wbnbFirst = same(token0, WBNB);
-  if (!(wbnbFirst ? same(token1, checked.token) : same(token0, checked.token) && same(token1, WBNB))) {
-    throw new Error('池子不是预期的 WBNB/Token 直连路径');
+  const quoteFirst = same(token0, asset);
+  if (!(quoteFirst ? same(token1, checked.token) : same(token0, checked.token) && same(token1, asset))) {
+    throw new Error('池子不是预期的支付币/Token 直连路径');
   }
   if (amounts.length !== 2 || amounts[0] !== settings.amountIn) throw new Error('路由报价与池子储备不一致');
-  const [reserveBnb, reserveToken] = wbnbFirst ? reserves : [reserves[1], reserves[0]];
+  const [reserveQuote, reserveToken] = quoteFirst ? reserves : [reserves[1], reserves[0]];
   const quoted = amounts[1];
-  const limits = marketLimits({ amountIn: settings.amountIn, reserveBnb, reserveToken, quoted, buyTax, sellTax, settings });
-  return { pair: factoryPair, quoted, buyTax, sellTax, reserveBnb, reserveToken, path, ...limits, blockNumber: block.number, readMode: 'aggregate' };
+  const limits = marketLimits({ amountIn: settings.amountIn, reserveQuote, reserveToken, quoted, buyTax, sellTax, settings });
+  return { pair: factoryPair, quoted, buyTax, sellTax, ...(native ? { reserveBnb: reserveQuote } : { reserveQuote, quoteToken }),
+    reserveToken, path, ...limits, blockNumber: block.number, readMode: 'aggregate' };
 }

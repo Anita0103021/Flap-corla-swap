@@ -1,13 +1,16 @@
-import { CORLA_ABI, createCorlaInspectionScope, inspectMint } from './corla.mjs';
+import { ZeroAddress } from 'ethers';
+import { CORLA_ABI, CORLA_QUOTE_ABI, createCorlaInspectionScope, inspectMint } from './corla.mjs';
 import { FACTORY } from './config.mjs';
 import { verifyLaunchCandidate } from './events.mjs';
+import { quoteAsset } from './quote-assets.mjs';
 
 const lower = s => typeof s === 'string' ? s.toLowerCase() : '';
 const hash = s => typeof s === 'string' && /^0x[0-9a-f]{64}$/i.test(s);
 const address = s => typeof s === 'string' && /^0x[0-9a-f]{40}$/i.test(s);
 const quantity = s => typeof s === 'string' && /^0x[0-9a-f]{1,64}$/i.test(s);
 const mintFunction = CORLA_ABI.getFunction('mint');
-const MAX_INPUT_CHARS = 2 + 2 * (4 + 64 + 32 * 64);
+const quoteMintFunction = CORLA_QUOTE_ABI.getFunction('mintQuote');
+const MAX_INPUT_CHARS = 2 + 2 * (4 + 96 + 32 * 64);
 const MAX_WS_CHARS = 128 * 1024;
 const MAX_PER_SECOND = 4096;
 const PENDING_AGE_MS = 120_000;
@@ -49,7 +52,8 @@ export async function armPendingTargets(provider, targets, { inspect = inspectMi
       const state = result.status === 'fulfilled' && result.value;
       if (state && !state.launched && !state.emergencyWithdrawn && state.phase === 1 &&
           state.fundingDeadline > BigInt(head.timestamp) && state.mintedLots < state.totalLots && state.pricePerLot > 0n) {
-        armed.push({ ...target, pricePerLot: state.pricePerLot });
+        armed.push({ ...target, pricePerLot: state.pricePerLot,
+          ...(state.quoteToken && state.quoteToken !== ZeroAddress ? { quoteToken: state.quoteToken, deploymentKey: state.deploymentKey } : {}) });
       } else excluded.push({ mint: target.mint, reason: state ? 'not_active_funding' : 'verification_unavailable_or_failed' });
     }
   }
@@ -63,16 +67,21 @@ export async function armPendingTargets(provider, targets, { inspect = inspectMi
 export function decodePendingMint(tx, targetsByMint) {
   if (!hash(tx?.hash) || !address(tx?.to) || !address(tx.from) || !quantity(tx.value) ||
       tx.blockHash != null || tx.blockNumber != null || tx.transactionIndex != null) return null;
-  const target = targetsByMint.get(lower(tx.to));
-  if (!target || BigInt(tx.value) !== target.pricePerLot) return null;
+  const isFactory = lower(tx.to) === lower(FACTORY);
   const input = lower(tx.input ?? tx.data);
-  if (input.length < 138 || input.length > MAX_INPUT_CHARS || !input.startsWith(mintFunction.selector) ||
+  const entry = isFactory ? quoteMintFunction : mintFunction;
+  const abi = isFactory ? CORLA_QUOTE_ABI : CORLA_ABI;
+  if (input.length < (isFactory ? 202 : 138) || input.length > MAX_INPUT_CHARS || !input.startsWith(entry.selector) ||
       !/^0x(?:[0-9a-f]{2})+$/.test(input)) return null;
   try {
-    const decoded = CORLA_ABI.decodeFunctionData(mintFunction, input);
-    if (lower(CORLA_ABI.encodeFunctionData(mintFunction, decoded)) !== input) return null;
+    const target = isFactory ? [...targetsByMint.values()].find(t => lower(t.deploymentKey) === '0x' + input.slice(10, 74)) :
+      targetsByMint.get(lower(tx.to));
+    if (!target || (quoteAsset(target.quoteToken) !== ZeroAddress) !== isFactory ||
+        BigInt(tx.value) !== (isFactory ? 0n : target.pricePerLot)) return null;
+    const decoded = abi.decodeFunctionData(entry, input);
+    if (lower(abi.encodeFunctionData(entry, decoded)) !== input) return null;
+    return { mint: target.mint, hash: lower(tx.hash) };
   } catch { return null; }
-  return { mint: target.mint, hash: lower(tx.hash) };
 }
 
 export function makePendingMintShadow({
@@ -173,7 +182,7 @@ export function makePendingTransactionFeed({
   wsUrl, signal, onTransaction, onStatus, services = {},
 }) {
   const endpoint = pendingWsUrl(wsUrl);
-  const { WebSocket = globalThis.WebSocket, clock = () => performance.now(),
+  const { WebSocket = globalThis.WebSocket, clock = () => performance.now(), wallClock = Date.now,
     connectTimeoutMs = 5000, staleMs = 20000, maxPerSecond = MAX_PER_SECOND } = services;
   let mode = 'idle', socket, timer, heartbeat, reconnect, stopped = false, started = false, epoch = 0;
   let connections = 0, full = 0, hashes = 0, dropped = 0, unrecognized = 0, lastDrop = -Infinity;
@@ -231,6 +240,8 @@ export function makePendingTransactionFeed({
       const currentSecond = Math.floor(now / 1000);
       if (currentSecond !== second) { second = currentSecond; inSecond = 0; }
       if (++inSecond > maxPerSecond) { dropped++; lastDrop = now; return; }
+      // Capture local arrival before JSON decoding or any target verification.
+      const receivedAtMs = wallClock();
       let packet;
       try { packet = JSON.parse(data); } catch { unrecognized++; return; }
       if (handshake === 1 && packet?.id === 1) {
@@ -273,7 +284,8 @@ export function makePendingTransactionFeed({
         full++;
         fullInEpoch++;
         lastPayload = now;
-        try { onTransaction(item); } catch { /* never let telemetry kill the feed */ }
+        try { onTransaction(item, { receivedAtMs, seen: now, mode: hashesInEpoch ? 'mixed' : 'full' }); }
+        catch { /* never let telemetry kill the feed */ }
       } else { unrecognized++; return; }
       report(fullInEpoch && hashesInEpoch ? 'mixed' : fullInEpoch ? 'full' : 'hash_only');
     });

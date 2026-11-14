@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { Interface, parseEther } from 'ethers';
+import { Interface, parseEther, ZeroAddress } from 'ethers';
 import { FACTORY } from '../src/config.mjs';
 import { CORLA_ABI } from '../src/corla.mjs';
 import { PANCAKE_FACTORY, ROUTER, WBNB, marketLimits, v2Output } from '../src/market.mjs';
@@ -33,6 +33,9 @@ const signature = (contract, data) => contract.toLowerCase() + ':' + data.slice(
 
 function providerFor(mode = {}) {
   const calls = [];
+  const quote = mode.quoteToken ?? WBNB;
+  const amountIn = mode.amountIn ?? settings.amountIn;
+  const reserveQuote = mode.reserveQuote ?? reserveBnb;
   return {
     calls,
     async getCode(to, at) {
@@ -50,17 +53,18 @@ function providerFor(mode = {}) {
         [target.mint, CORLA_ABI, 'token', [mode.actualToken ?? target.token]],
         [target.mint, CORLA_ABI, 'pool', [mode.actualPool ?? pool]],
         [target.mint, CORLA_ABI, 'emergencyWithdrawn', [mode.withdrawn ?? false]],
+        [target.mint, CORLA_ABI, 'quoteToken', [mode.onChainQuote ?? mode.quoteToken ?? ZeroAddress]],
         [beacon, 'function implementation() view returns(address)', 'implementation', [mode.implementation ?? implementation]],
         [target.token, 'function mainPool() view returns (address)', 'mainPool', [mode.mainPool ?? pool]],
         [target.token, 'function buyTaxRate() view returns (uint16)', 'buyTaxRate', [mode.buyTax ?? buyTax]],
         [target.token, 'function sellTaxRate() view returns (uint16)', 'sellTaxRate', [mode.sellTax ?? sellTax]],
         [PANCAKE_FACTORY, 'function getPair(address,address) view returns (address)', 'getPair', [mode.factoryPair ?? pool]],
-        [pool, 'function token0() view returns (address)', 'token0', [mode.reverse ? target.token : WBNB]],
-        [pool, 'function token1() view returns (address)', 'token1', [mode.reverse ? WBNB : target.token]],
+        [pool, 'function token0() view returns (address)', 'token0', [mode.reverse ? target.token : quote]],
+        [pool, 'function token1() view returns (address)', 'token1', [mode.reverse ? quote : target.token]],
         [pool, 'function getReserves() view returns (uint112,uint112,uint32)', 'getReserves',
-          mode.reverse ? [reserveToken, reserveBnb, 1000] : [reserveBnb, reserveToken, 1000]],
+          mode.reverse ? [reserveToken, reserveQuote, 1000] : [reserveQuote, reserveToken, 1000]],
         [ROUTER, 'function getAmountsOut(uint256,address[]) view returns (uint256[])', 'getAmountsOut',
-          [[settings.amountIn, mode.quote ?? quoted]]],
+          [[amountIn, mode.quote ?? v2Output(amountIn, reserveQuote, reserveToken)]]],
       ];
       const bySignature = new Map(definitions.map(([address, abi, name, values]) => {
         const iface = typeof abi === 'string' ? new Interface([abi]) : abi;
@@ -69,11 +73,21 @@ function providerFor(mode = {}) {
       const respond = (to, data) => {
         const known = bySignature.get(signature(to, data));
         assert.ok(known, 'unexpected selector ' + signature(to, data));
+        if (known.name === 'getPair') {
+          const iface = new Interface(['function getPair(address,address) view returns (address)']);
+          assert.deepEqual([...iface.decodeFunctionData('getPair', data)], [quote, target.token]);
+        }
+        if (known.name === 'getAmountsOut') {
+          const iface = new Interface(['function getAmountsOut(uint256,address[]) view returns (uint256[])']);
+          const [actualAmount, route] = iface.decodeFunctionData('getAmountsOut', data);
+          assert.equal(actualAmount, amountIn);
+          assert.deepEqual([...route], [quote, target.token]);
+        }
         return known;
       };
       if (tx.to !== multi) return respond(tx.to, tx.data).bytes;
       const [batch] = MULTI.decodeFunctionData('aggregate3', tx.data);
-      assert.ok(batch.length === 2 || batch.length === 15);
+      assert.ok(batch.length === 2 || batch.length === (mode.quoteToken ? 16 : 15));
       if (batch.length > 2 && mode.error) throw mode.error;
       if (batch.length > 2 && mode.empty) return '0x';
       const rows = batch.map(row => {
@@ -102,6 +116,26 @@ test('trusted pinned Multicall exactly reproduces direct minOut and retains all 
   const reversed = providerFor({ reverse: true });
   await warmSnipeMarket(reversed, block);
   assert.deepEqual(result, await readSnipeMarket(reversed, target, pool, settings, block));
+});
+
+test('aggregated and direct quotes agree on a six-decimal ERC-20 pair and its on-chain asset', async () => {
+  const quoteToken = '0x0000000000000000000000000000000000000088';
+  const project = { ...target, quoteToken };
+  const amountIn = 10_000_000n, reserveQuote = 1500_000_000n;
+  const trade = { ...settings, quoteToken, quoteDecimals: 6, amountIn, minLiquidity: 100_000_000n };
+  const mode = { quoteToken, amountIn, reserveQuote, reverse: true };
+  const agg = providerFor(mode);
+  await warmSnipeMarket(agg, block);
+  const result = await readSnipeMarket(agg, project, pool, trade, block);
+  assert.deepEqual(result.path, [quoteToken, target.token]);
+  assert.equal(result.reserveQuote, reserveQuote);
+  assert.equal(result.reserveBnb, undefined);
+  assert.equal(result.quoted, v2Output(amountIn, reserveQuote, reserveToken));
+  const direct = providerFor({ ...mode, code: '0x' });
+  assert.deepEqual(await readSnipeMarket(direct, project, pool, trade, block), { ...result, readMode: 'direct' });
+  mode.onChainQuote = other;
+  await assert.rejects(readSnipeMarket(agg, project, pool, trade, block), /当前开盘状态/);
+  await assert.rejects(readSnipeMarket(direct, project, pool, { ...trade, quoteToken: other }, block), /支付币不匹配/);
 });
 
 test('negative market/state results and unsafe RPC results cannot trigger direct fallback', async () => {

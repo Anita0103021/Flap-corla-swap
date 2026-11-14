@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const app = await readFile(new URL('../ui/app.js', import.meta.url), 'utf8');
+const html = await readFile(new URL('../ui/index.html', import.meta.url), 'utf8');
 const zero = '0x' + '0'.repeat(40);
 const address = n => '0x' + n.toString(16).padStart(40, '0');
 const makeRow = n => ({ mint: address(n), token: address(100 + n), url: 'test:' + n });
@@ -37,6 +38,7 @@ function testUi(handler) {
   vm.runInContext([
     between('const HEX_ADDRESS', 'const defaults'),
     between('const CATALOG_LIMIT', 'let metadataInFlight'),
+    between('const catalogDate', 'function catalogInteger'),
     between('function short', 'function decimal'),
     between('function formatUnits', 'function parseLink'),
     between('function same', 'function imageUrl'),
@@ -59,7 +61,77 @@ function actions(node) {
   return [...(node.dataset.catalogAction ? [node.dataset.catalogAction] : []), ...node.children.flatMap(actions)];
 }
 
-test('catalog cards render verified token quotes and never expose ERC-20 trading buttons', () => {
+function testDirectory(api) {
+  const state = { session: 'test', reloadRequired: false };
+  const controls = {
+    'catalog-quote-summary': { textContent: '' },
+    'catalog-quote-filter': { value: 'enabled' },
+    'catalog-quote-refresh': { disabled: false },
+    'catalog-quote-list': { rows: [], replaceChildren(...rows) { this.rows = rows; } },
+  };
+  const context = vm.createContext({
+    $, api, state, fmtInt: new Intl.NumberFormat('en-US'), ZERO_ADDRESS: zero, EXPLORER: 'https://example.org',
+    element: (tag, cls, text) => ({ tag, cls, text, append(...args) { this.children = args; } }),
+    external: (_url, _cls, text) => text, badge: text => text,
+  });
+  function $(key) { return controls[key]; }
+  vm.runInContext(app.slice(app.indexOf('let quoteDirectoryRequest'), app.indexOf('function renderDiscover()')) +
+    '\nglobalThis.directory = { loadQuoteDirectory, renderQuoteDirectory };', context);
+  return { ...context.directory, state, summary: controls['catalog-quote-summary'], refresh: controls['catalog-quote-refresh'],
+    filter: controls['catalog-quote-filter'], list: controls['catalog-quote-list'] };
+}
+
+test('a stale backend 404 explains that a restart is needed, while refresh can still recover', async () => {
+  let calls = 0;
+  const ui = testDirectory(async (path, body) => {
+    assert.equal(path, 'catalog/quote-assets');
+    assert.equal(Object.keys(body).length, 0);
+    if (++calls === 1) throw Object.assign(new Error('页面不存在'), { status: 404 });
+    return { block: 4321, assets: [{ address: zero, symbol: 'BNB', status: 'enabled', category: 'featured', decimals: 18 }] };
+  });
+  await ui.loadQuoteDirectory();
+  assert.match(ui.summary.textContent, /未加载底池接口.*重启 Corla/);
+  assert.equal(ui.refresh.disabled, false);
+  await ui.loadQuoteDirectory();
+  assert.match(ui.summary.textContent, /#4,321 · 1 个已开放/);
+  assert.equal(ui.list.rows.length, 1);
+  assert.equal(ui.list.rows[0].children[0].text, 'BNB');
+});
+
+test('refresh failures retain the previous catalog and zero verified assets have an explanation', async () => {
+  let calls = 0;
+  const ui = testDirectory(async () => {
+    if (calls++ > 0) throw Object.assign(new Error('offline'), { status: 503 });
+    return { block: 4321, assets: [{ address: zero, symbol: 'BNB', status: 'unknown', category: 'featured', decimals: 18 }] };
+  });
+  await ui.loadQuoteDirectory();
+  assert.match(ui.list.rows[0].text, /待核验.*全部候选/);
+  ui.filter.value = 'all';
+  ui.renderQuoteDirectory();
+  assert.equal(ui.list.rows[0].children[0].text, 'BNB');
+  const refresh = ui.loadQuoteDirectory();
+  assert.match(ui.summary.textContent, /正在刷新，保留上次结果/);
+  await refresh;
+  assert.match(ui.summary.textContent, /查询失败.*显示上次结果.*#4,321/);
+  assert.equal(ui.list.rows[0].children[0].text, 'BNB');
+});
+
+test('catalog tools stay in the page header, separate from the query and sync status', () => {
+  const markup = html.slice(html.indexOf('id="view-discover"'), html.indexOf('id="view-wallets"'));
+  const part = (begin, end) => markup.slice(markup.indexOf(begin), markup.indexOf(end));
+  const heading = part('catalog-heading', 'catalog-toolbar');
+  const toolbar = part('catalog-toolbar', 'catalog-caption');
+  const caption = part('catalog-caption', 'id="catalog-notice"');
+  assert.match(heading, /class="catalog-utilities"[\s\S]*id="catalog-quote-open"[\s\S]*id="catalog-notification-link"/);
+  assert.match(toolbar, /id="catalog-filters"[\s\S]*id="catalog-search"[\s\S]*id="catalog-sort"/);
+  assert.doesNotMatch(toolbar, /id="catalog-(quote-open|notification-link|live-label)"/);
+  assert.match(caption, /id="catalog-summary"[\s\S]*id="catalog-live-label"[\s\S]*id="catalog-updated"/);
+  const directory = html.slice(html.indexOf('id="catalog-quote-dialog"'), html.indexOf('id="project-remove-dialog"'));
+  assert.match(directory, /class="quote-directory-controls"[\s\S]*id="catalog-quote-filter"[\s\S]*id="catalog-quote-refresh"/);
+  assert.doesNotMatch(directory, /catalog-search-tools/);
+});
+
+test('catalog cards offer ERC-20 Mint and sniping while funding, and claiming after launch', () => {
   const ui = testUi();
   const row = makeRow(1);
   const status = makeStatus(row, { quoteToken: address(999), quoteSymbol: 'QUOTE', quoteDecimals: 6 });
@@ -68,20 +140,23 @@ test('catalog cards render verified token quotes and never expose ERC-20 trading
   assert.match(card.textContent, /200 \/ 200 批100%/);
   assert.match(card.textContent, /5 QUOTE/);
   assert.match(card.textContent, /1000 QUOTE/);
-  assert.match(card.textContent, /QUOTE 代币支付 · 仅供查看/);
-  assert.deepEqual(actions(card), ['copy', 'official']);
+  assert.match(card.textContent, /配置领币/);
+  assert.deepEqual(actions(card), ['copy', 'official', 'mint']);
   const noSymbol = renderCard(ui, row, { ...status, quoteSymbol: null, quoteDecimals: 0 });
   assert.match(noSymbol.textContent, /5000000 0x000000…0003e7/);
   const unverifiedDecimals = renderCard(ui, row, { ...status, quoteDecimals: null });
   assert.match(unverifiedDecimals.textContent, /Mint 单批—/);
   assert.doesNotMatch(unverifiedDecimals.textContent, /5000000| BNB/);
+  const active = { ...status, launched: false, phase: 1, mintedLots: '100', fundingDeadline: 9_000 };
+  assert.deepEqual(actions(renderCard(ui, row, active)), ['copy', 'official', 'mint', 'snipe']);
+  assert.deepEqual(actions(renderCard(ui, row, { ...active, quoteDecimals: null })), ['copy', 'official']);
 });
 
 test('catalog never guesses a quote from a factory row and preserves verified native actions', () => {
   const ui = testUi();
   const row = makeRow(1);
   const pending = renderCard(ui, { ...row, pricePerLot: '5000000000000000' });
-  assert.match(pending.textContent, /支付币种待核验/);
+  assert.match(pending.textContent, /支付币种或精度待核验/);
   assert.doesNotMatch(pending.textContent, / BNB/);
   assert.deepEqual(actions(pending), ['copy', 'official']);
   const noAddress = renderCard(ui, row, makeStatus(row, { quoteToken: undefined, nativeQuote: true }));

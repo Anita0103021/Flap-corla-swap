@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { AbiCoder, Interface } from 'ethers';
+import { Interface } from 'ethers';
 import { FACTORY, address } from './config.mjs';
+import { readCorlaCreation } from './corla-creation.mjs';
 
 // Flap's documented gateway. Never fetch a publisher-supplied host or redirect.
 export const FLAP_IMAGE_ORIGIN = 'https://flap.mypinata.cloud';
@@ -8,14 +9,7 @@ const IPFS_HOSTS = new Set([FLAP_IMAGE_ORIGIN, 'https://ipfs.io', 'https://gatew
 const CID = /^(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,104})$/;
 const SEGMENT = /^[A-Za-z0-9_.~-]{1,80}$/;
 const MAX_JSON_BYTES = 48 * 1024;
-const MAX_PARAMS_BYTES = 128 * 1024;
 const MAX_DESCRIPTION_CHARS = 180;
-const PARAMS_SELECTOR = '0xbd4d3c40'; // getCreationParams()
-const ABI = AbiCoder.defaultAbiCoder();
-// Corla v4's launch tuple matches Flap's documented CreateTaxTokenParams.
-// totalSupply is the creator-chosen initial amount (18 decimals), not a live
-// ERC-20 totalSupply() read. Verified against the historical portal receipt.
-const CREATION = 'tuple(tuple(uint256,uint256,uint32,bool,uint32,address[]),tuple(string name,string symbol,string meta,uint256 totalSupply,bytes32,address,uint8,uint256,uint256,uint16,uint16,uint32,uint32,tuple(uint8,uint16,bytes)[],uint8,uint32,address[],uint256,bytes32,bytes,address) launch,tuple(uint8,address,uint128,bytes))';
 const REGISTRY = new Interface([
   'function deploymentIndexPlusOne(address) view returns (uint256)',
   'function deployment(uint256) view returns (address mint, address creator, address expectedToken)',
@@ -44,7 +38,7 @@ function safeLabel(value, length) {
   return Array.from(clean).slice(0, length).join('') || undefined;
 }
 
-function rawCidDigest(path) {
+export function rawCidDigest(path) {
   if (!/^b[a-z2-7]+$/.test(path)) return null;
   const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
   const bytes = [];
@@ -103,16 +97,15 @@ async function fetchDisplayMeta(fetchImpl, path, timeoutMs) {
 }
 
 async function readCreation(provider, target, blockTag) {
-  const [indexResult, raw] = await Promise.all([
+  const [indexResult, params] = await Promise.all([
     provider.call({ to: FACTORY, data: REGISTRY.encodeFunctionData('deploymentIndexPlusOne', [target.mint]), blockTag }),
-    provider.call({ to: target.mint, data: PARAMS_SELECTOR, blockTag }),
+    readCorlaCreation(provider, target.mint, blockTag),
   ]);
   const [index] = REGISTRY.decodeFunctionResult('deploymentIndexPlusOne', indexResult);
-  if (index === 0n || typeof raw !== 'string' || raw.length > MAX_PARAMS_BYTES * 2 + 2) return null;
+  if (index === 0n) return null;
   const deployment = await provider.call({ to: FACTORY, data: REGISTRY.encodeFunctionData('deployment', [index - 1n]), blockTag });
   const [mint, , expectedToken] = REGISTRY.decodeFunctionResult('deployment', deployment);
   if (mint !== target.mint || expectedToken !== target.token) return null;
-  const [params] = ABI.decode([CREATION], raw);
   return {
     name: safeLabel(params.launch.name, 80),
     symbol: safeLabel(params.launch.symbol, 32),

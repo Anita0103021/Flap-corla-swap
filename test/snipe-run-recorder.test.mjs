@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { Interface } from 'ethers';
 import { CORLA_LAUNCH_TOPIC } from '../src/events.mjs';
-import { createSnipeReceiptObserver, createSnipeRunRecorder } from '../src/snipe-run-recorder.mjs';
+import { createSnipeReceiptObserver, createSnipeRunRecorder, findLatestSnipeReport } from '../src/snipe-run-recorder.mjs';
 
 const MINT = '0x' + '01'.repeat(20), TOKEN = '0x' + '02'.repeat(20);
 const WALLET = '0x' + '03'.repeat(20), TX = '0x' + 'ab'.repeat(32), BLOCK = '0x' + 'bc'.repeat(32);
@@ -97,6 +97,21 @@ test('a reports directory that resolves outside the workspace is refused', async
   const outside = await sandbox(t);
   await symlink(outside, join(rootDir, 'reports'), process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(createSnipeRunRecorder({ rootDir, targets: [target], armBlock: 41 }), /无法创建狙击测速记录/);
+  await assert.rejects(findLatestSnipeReport(rootDir), /escaped workspace/);
+});
+
+test('recovers the newest report across processes without creating a folder while idle', async t => {
+  const root = await sandbox(t);
+  assert.equal(await findLatestSnipeReport(root), null);
+  const dir = join(root, 'reports', 'snipe-runs');
+  await mkdir(dir, { recursive: true });
+  for (const file of [
+    'snipe-2026-11-13T21-30-00-900Z-1111111111.ndjson',
+    'snipe-2026-11-14T21-30-00-001Z-2222222222.ndjson',
+    'snipe-does-not-match.ndjson',
+  ]) await writeFile(join(dir, file), '');
+  await mkdir(join(dir, 'snipe-2027-01-01T00-00-00-000Z-3333333333.ndjson'));
+  assert.equal(await findLatestSnipeReport(root), 'reports/snipe-runs/snipe-2026-11-14T21-30-00-001Z-2222222222.ndjson');
 });
 
 test('receipt index enrichment only uses canonical observations and deduplicates independently of send', { timeout: 2000 }, async () => {

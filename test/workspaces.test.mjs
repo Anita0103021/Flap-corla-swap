@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { getAddress, parseEther } from 'ethers';
 import { checkBudget, mintWalletsFor, parseMintLink, validateConfig } from '../src/config.mjs';
+import { MAX_SNIPE_ATTEMPTS } from '../src/snipe-limits.mjs';
 
 const example = JSON.parse(await readFile(new URL('../config.example.json', import.meta.url), 'utf8'));
 const firstUrl = example.targets[0].url;
@@ -21,7 +22,7 @@ function raw() {
     maxTotalBnb: '1',
     targets: [{ url: firstUrl, mintBatches: 3, maxMintPriceBnb: '0.1', autoClaim: true, mintWallets: [secondWallet.toLowerCase()] }],
     snipeTargets: [secondUrl],
-    snipe: { ...example.snipe, amountBnb: '0.4', walletCount: 1 },
+    snipe: { ...example.snipe, amountBnb: '0.4', walletCount: 1, requirePreopen: false, repeatAttempts: 1 },
   };
 }
 
@@ -41,6 +42,46 @@ test('opening guard is on for old configurations, cannot be widened beyond 10%, 
   cfg.snipe.repeatAttempts = 3;
   assert.equal(configFor(cfg, 'snipe').snipe.maxOpeningPremiumBps, 0);
   assert.equal(configFor(cfg, 'snipe').snipe.requirePreopen, true);
+});
+
+test('no chase and two rounds default together, while saved choices are retained', () => {
+  const cfg = raw();
+  delete cfg.snipe.requirePreopen;
+  delete cfg.snipe.repeatAttempts;
+  const policy = () => {
+    const { requirePreopen, repeatAttempts } = configFor(cfg, 'snipe').snipe;
+    return [requirePreopen, repeatAttempts];
+  };
+  assert.deepEqual(policy(), [true, 2]);
+  cfg.snipe.requirePreopen = false;
+  assert.deepEqual(policy(), [false, 1]);
+  cfg.snipe.repeatAttempts = 3;
+  assert.deepEqual(policy(), [false, 3]);
+  cfg.snipe.requirePreopen = true;
+  assert.deepEqual(policy(), [true, 3]);
+  cfg.snipe.requirePreopen = null;
+  assert.throws(policy, /requirePreopen/);
+});
+
+test('broadcast threads default to one, validate with an empty list, and do not multiply the budget', () => {
+  const cfg = raw();
+  delete cfg.snipe.broadcastConcurrency;
+  assert.equal(configFor(cfg, 'snipe').snipe.broadcastConcurrency, 1);
+  cfg.snipe.broadcastConcurrency = 8;
+  cfg.snipe.repeatAttempts = 2;
+  const snipe = configFor(cfg, 'snipe');
+  assert.equal(snipe.snipe.broadcastConcurrency, 8);
+  assert.equal(snipe.snipe.repeatAttempts, 2);
+  assert.equal(checkBudget(snipe, wallets), parseEther('0.805'));
+  for (const invalid of [null, '2', 0, 1.5, 9]) {
+    cfg.snipe.broadcastConcurrency = invalid;
+    assert.throws(() => configFor({ ...cfg, snipeTargets: [] }, 'all'), /broadcastConcurrency/);
+  }
+  cfg.snipe.broadcastConcurrency = 3;
+  cfg.snipe.repeatAttempts = MAX_SNIPE_ATTEMPTS;
+  assert.equal(configFor(cfg, 'snipe').snipe.repeatAttempts, MAX_SNIPE_ATTEMPTS);
+  cfg.snipe.repeatAttempts++;
+  assert.throws(() => configFor({ ...cfg, snipeTargets: [] }, 'all'), /repeatAttempts/);
 });
 
 test('Mint and snipe workspaces independently compile different allowlists and actions', () => {

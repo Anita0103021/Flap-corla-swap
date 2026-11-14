@@ -1,7 +1,7 @@
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { CHAIN_ID, parseMintLink, readJson, snipeTargetUrls } from '../src/config.mjs';
+import { CHAIN_ID, parseMintLink, readJson, snipeTargetUrl, snipeTargetUrls } from '../src/config.mjs';
 import { makeLaunchFeed } from '../src/launch-feed.mjs';
 import { shortError } from '../src/monitor.mjs';
 import { armPendingTargets, makePendingMintShadow, makePendingTransactionFeed, pendingWsUrl } from '../src/pending-mint-shadow.mjs';
@@ -41,7 +41,7 @@ async function main() {
     } catch { throw new Error('无法读取狙击项目名单，请使用 --config 或 --target'); }
   }
   if (!Array.isArray(links) || !links.length || links.length > 32) throw new Error('请提供 1–32 个 Corla v4 项目');
-  const configured = links.map(parseMintLink);
+  const configured = links.map(row => parseMintLink(snipeTargetUrl(row)));
   const provider = createRpcPool(BUILTIN_WATCH_RPC_URLS, { lowLatency: true, requiredMethods: ['eth_getLogs'] });
   const stop = new AbortController();
   const interrupt = () => stop.abort();

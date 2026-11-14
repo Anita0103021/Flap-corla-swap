@@ -1,0 +1,42 @@
+{
+  "block": 133546461,
+  "cid": "bafkreie2gef3crgos7qp3m7l7vz2wqjycjulora6y4evvzqicgu5h75ke4",
+  "total": 104,
+  "enabled": [
+    {
+      "address": "0x0000000000000000000000000000000000000000",
+      "symbol": "BNB",
+      "decimals": 18
+    },
+    {
+      "address": "0x55d398326f99059fF775485246999027B3197955",
+      "symbol": "USDT",
+      "decimals": 18
+    },
+    {
+      "address": "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d",
+      "symbol": "USD1",
+      "decimals": 18
+    },
+    {
+      "address": "0x1Ba42e5193dfA8B03D15dd1B86a3113bbBEF8Eeb",
+      "symbol": "ZCASH",
+      "decimals": 18
+    },
+    {
+      "address": "0x205812CdBed920aFf76C6580abD681a46D11efc7",
+      "symbol": "QQQB",
+      "decimals": 18
+    },
+    {
+      "address": "0x4902C5ebc598265Ed2212b559B042De8a5Eeec3f",
+      "symbol": "BNCB",
+      "decimals": 18
+    },
+    {
+      "address": "0x9b8E987e6fEc8Cf1380C4dcA7071e2C7853AEEA1",
+      "symbol": "FXIon",
+      "decimals": 18
+    }
+  ]
+}

@@ -3,7 +3,7 @@ import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { resolve } from 'node:path';
-import { CHAIN_ID, address, checkBudget, int, loadConfig } from './config.mjs';
+import { CHAIN_ID, address, checkBudget, int, loadConfig, quoteSpendRows, snipeSettingsForTarget } from './config.mjs';
 import { inspectMint, inspectParticipant } from './corla.mjs';
 import { discoverProjects } from './events.mjs';
 import { readMarket, verifyRoundTrip } from './market.mjs';
@@ -12,6 +12,8 @@ import { loadWallets, makeExecutor } from './execution.mjs';
 import { createRpcPool } from './rpc-pool.mjs';
 import { rpcPoolPlan } from './rpc-config.mjs';
 import { requireRuntime } from './runtime.mjs';
+import { prepareQuoteAllowances } from './quote-allowances.mjs';
+import { formatQuoteUnits } from './quote-assets.mjs';
 
 const help = `Flap Corla Mint Tool · BNB Smart Chain (56)
   npm start -- status   [--config FILE]
@@ -34,13 +36,22 @@ async function confirmLive(cfg, wallets, budget) {
   for (const t of cfg.targets) {
     console.log('  Token: ' + t.token + ' / Mint: ' + t.mint);
     console.log('    每钱包 Mint: ' + t.mintBatches + ' 批'
-      + (t.mintBatches ? '（每批不超过 ' + formatEther(t.maxMintPriceWei) + ' BNB）' : '')
+      + (t.mintBatches ? '（每批不超过 ' + (t.mintQuote ?
+        formatQuoteUnits(t.mintQuote.priceLimit, t.mintQuote.quoteDecimals) + ' / 支付币 ' + t.mintQuote.quoteToken :
+        formatEther(t.maxMintPriceWei) + ' BNB') + '）' : '')
       + '；自动领取: ' + (t.autoClaim ? '是' : '否') + '；开盘买入: ' + (t.buyOnLaunch ? '是' : '否'));
   }
-  if (cfg.snipe) console.log('  买入: 前 ' + cfg.snipe.walletCount + ' 个钱包，每钱包 ' + formatEther(cfg.snipe.amountIn)
-    + ' BNB；最低 WBNB 储备 ' + formatEther(cfg.snipe.minLiquidity) + ' BNB；最大滑点 '
-    + cfg.snipe.slippageBps + ' bps；开盘价溢价上限 ' + cfg.snipe.maxOpeningPremiumBps
-    + ' bps；只对启动后开盘且距开盘未超 ' + cfg.snipe.windowBlocks + ' 块的项目下单。');
+  if (cfg.snipe) {
+    console.log('  买入: 前 ' + cfg.snipe.walletCount + ' 个钱包；最大滑点 '
+      + cfg.snipe.slippageBps + ' bps；开盘价溢价上限 ' + cfg.snipe.maxOpeningPremiumBps
+      + ' bps；只对启动后开盘且距开盘未超 ' + cfg.snipe.windowBlocks + ' 块的项目下单。');
+    if (cfg.targets.some(t => t.buyOnLaunch && !t.snipeQuote)) console.log('  BNB 项目每钱包买入 ' + formatEther(cfg.snipe.amountIn)
+      + ' BNB；最低 WBNB 储备 ' + formatEther(cfg.snipe.minLiquidity) + ' WBNB。');
+  }
+  const quotes = quoteSpendRows(cfg, wallets);
+  for (const row of quotes) console.log('  ' + row.wallet.address + ' / ' + row.target.token + ': ' +
+    formatQuoteUnits(row.amount, row.quoteDecimals) + ' 支付币 ' + row.quoteToken);
+  if (quotes.length) console.log('  支付币本金与 BNB 分开，额度不足会先授权至确认金额：Mint 授权 Corla 工厂，买入授权 Pancake V2 Router。');
   console.log('  预估最坏支出（含 Gas 上限）: ' + formatEther(budget) + ' BNB；Gas 上限: '
     + formatUnits(cfg.maxGasPriceWei, 9) + ' Gwei × ' + cfg.gasLimitCap);
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
@@ -73,6 +84,7 @@ async function main() {
     throw new Error('命令行实盘不支持「没抢到开盘就不追」，请使用网页「开盘狙击」工作区');
   }
   if (flags.live && cfg.snipe?.repeatAttempts > 1) throw new Error('多次竞争狙击目前仅在网页「开盘狙击」工作区运行');
+  if (flags.live && cfg.snipe?.broadcastConcurrency > 1) throw new Error('多节点并发投递仅在网页「开盘狙击」工作区运行');
   const plan = rpcPoolPlan(cfg, command === 'discover' ? 'discovery' : command === 'quote' ? 'snipe' : 'mint');
   const provider = createRpcPool(plan.urls, plan);
   let execute;
@@ -111,9 +123,13 @@ async function main() {
           log('quote_skipped', { token: target.token, reason: '未开盘' });
           continue;
         }
-        const market = await readMarket(provider, target, state, cfg.snipe, block);
-        await verifyRoundTrip(provider, market, wallet, cfg.snipe, block, { fundSimulation: true });
-        log('quote_simulated', { token: target.token, wallet, valueWei: cfg.snipe.amountIn, ...market, historicalQuoteOnly: true });
+        const trade = snipeSettingsForTarget(cfg.snipe, target);
+        if (trade.quoteToken && !flags.wallet) throw new Error('ERC-20 买卖模拟请用 --wallet 指定有支付币余额和 Router 额度的公开地址');
+        if (trade.quoteToken && state.quoteDecimals !== trade.quoteDecimals) throw new Error('支付币精度与配置不符');
+        const market = await readMarket(provider, target, state, trade, block);
+        await verifyRoundTrip(provider, market, wallet, trade, block, { fundSimulation: !trade.quoteToken });
+        log('quote_simulated', { token: target.token, wallet, amountIn: trade.amountIn, valueWei: trade.quoteToken ? 0n : trade.amountIn,
+          ...market, historicalQuoteOnly: true });
         successes++;
       }
       if (!successes) throw new Error('没有已开盘项目可模拟');
@@ -132,6 +148,7 @@ async function main() {
     try {
       execute = await makeExecutor({ provider, wallets, live, signal, maxGasPriceWei: cfg.maxGasPriceWei, gasLimitCap: cfg.gasLimitCap,
         journalPath: cfg.journalPath, confirmations: 3, receiptTimeoutMs: 1500 });
+      if (live) await prepareQuoteAllowances({ provider, cfg, wallets, execute, signal, log });
       const armBlock = await provider.getBlockNumber();
       if (signal.aborted) return;
       watching = true;

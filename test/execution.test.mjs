@@ -5,9 +5,11 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { Transaction, Wallet } from 'ethers';
+import { DatabaseSync } from 'node:sqlite';
 import { loadWallets, makeExecutor } from '../src/execution.mjs';
 import { buildBuy, WBNB } from '../src/market.mjs';
 import { createRpcPool } from '../src/rpc-pool.mjs';
+import { MAX_SNIPE_ATTEMPTS } from '../src/snipe-limits.mjs';
 
 const to = '0x0000000000000000000000000000000000000001';
 const data = '0x12345678';
@@ -193,6 +195,64 @@ test('fast broadcast submits one raw RPC call and does not wait on a receipt bef
   assert.deepEqual(times, [['send', result.txHash], ['ack', result.txHash]]);
   assert.equal(rpc.attempts, 1);
   assert.equal(rpc.reads, 0);
+});
+
+test('one signing and journal reservation back a concurrent RPC wave, including an ambiguous response', async t => {
+  const account = Wallet.createRandom();
+  let signatures = 0;
+  const wallet = {
+    address: account.address,
+    async signTransaction(request) { signatures++; return account.signTransaction(request); },
+  };
+  const rpc = fakeRpc();
+  const dbPath = join(await temp(t), 'fanout.sqlite');
+  const posts = [];
+  const nodes = ['https://node-one.invalid', 'https://node-two.invalid'];
+  const pool = createRpcPool(nodes, {
+    fetch: async (url, { body }) => {
+      const p = JSON.parse(typeof body === 'string' ? body : await new Response(body).text());
+      if (p.method === 'eth_sendRawTransaction') {
+        const signed = Transaction.from(p.params[0]);
+        posts.push({ node: new URL(url).origin, raw: p.params[0], hash: signed.hash });
+        return new Response(null, { status: 504 }); // The node might still have received it.
+      }
+      assert.ok(['eth_chainId', 'eth_blockNumber'].includes(p.method));
+      return Response.json({ id: p.id, jsonrpc: '2.0', result: p.method === 'eth_chainId' ? '0x38' : '0x100' });
+    },
+  });
+  const dispatches = [];
+  rpc.submitRawTransaction = (raw, options) => {
+    assert.equal(options.singleSubmission, true);
+    assert.equal(options.broadcastConcurrency, 2);
+    const signed = Transaction.from(raw);
+    const read = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const row = read.prepare('SELECT tx_hash, nonce, status FROM actions').get();
+      assert.equal(row.tx_hash, signed.hash);
+      assert.equal(row.nonce, signed.nonce);
+      assert.equal(row.status, 'pending');
+    } finally { read.close(); }
+    return pool.submitRawTransaction(raw, { ...options, onDispatch(count) {
+      dispatches.push(count);
+      options.onDispatch(count);
+    } });
+  };
+  const executor = makeExecutor(opts(rpc, [wallet], dbPath, { directBroadcast: true, broadcastConcurrency: 2 }));
+  closeAfter.get(t).push(() => { executor.close(); pool.destroy(); });
+  const broadcasts = [];
+  const request = { actionId: 'buy:fanout', wallet, tx, singleSubmission: true, onBroadcast: (stage, meta) =>
+    broadcasts.push([stage, meta.txHash, meta.broadcastConcurrency]) };
+  const pending = await executor(request);
+  assert.equal(pending.status, 'pending');
+  assert.equal(posts.length, 2);
+  assert.deepEqual(posts.map(p => p.node).sort(), nodes);
+  assert.equal(posts[0].raw, posts[1].raw);
+  assert.equal(posts[0].hash, pending.txHash);
+  assert.deepEqual(dispatches, [2]);
+  assert.equal((await executor(request)).txHash, pending.txHash);
+  assert.equal(posts.length, 2);
+  assert.equal(signatures, 1);
+  assert.deepEqual(broadcasts, [['send', pending.txHash, 2]]);
 });
 
 test('a prepared fee overlaps exact preflight but cannot bypass a fresh wallet check', { timeout: 3000 }, async t => {
@@ -532,6 +592,86 @@ test('race cap survives restart and a legacy base action prevents a second trade
   assert.equal(rpc.attempts, 2);
 });
 
+test('upgrading the five-round journal preserves prior reservations and enables later ordinals on new projects', async t => {
+  const wallet = Wallet.createRandom();
+  const rpc = raceRpc();
+  const path = join(await temp(t), 'race-upgrade.sqlite');
+  const options = opts(rpc, [wallet], path, { directBroadcast: true });
+  const firstExecutor = makeExecutor(options);
+  const request = { actionId: raceBase, wallet, tx: raceTx(wallet), maxAttempts: 5 };
+  let first;
+  try {
+    first = await firstExecutor.race(request);
+    assert.equal(first.attempt, 1);
+    assert.equal(first.status, 'pending');
+  } finally { firstExecutor.close(); }
+  const db = new DatabaseSync(path);
+  try {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE old_race_attempts (
+        wallet TEXT NOT NULL,
+        base_action_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 5),
+        action_id TEXT NOT NULL,
+        max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 5),
+        PRIMARY KEY(wallet, base_action_id, attempt),
+        UNIQUE(wallet, action_id)
+      ) STRICT;
+      INSERT INTO old_race_attempts SELECT * FROM race_attempts;
+      DROP TABLE race_attempts;
+      ALTER TABLE old_race_attempts RENAME TO race_attempts;
+      COMMIT;`);
+  } finally { db.close(); }
+  const executor = makeExecutor(options);
+  closeAfter.get(t).push(() => executor.close());
+  const bigger = { ...request, maxAttempts: MAX_SNIPE_ATTEMPTS };
+  let current = await executor.race(bigger);
+  assert.equal(current.status, 'pending');
+  assert.equal(current.txHash, first.txHash);
+  assert.equal(rpc.attempts, 1);
+  function revert(tx) {
+    rpc.receipts.set(tx.txHash, receipt(tx.txHash, wallet.address, 0));
+    rpc.latestNonce = ++rpc.nonce;
+  }
+  revert(current);
+  for (let round = 2; round <= 5; round++) {
+    current = await executor.race(bigger);
+    assert.equal(current.attempt, round);
+    revert(current);
+  }
+  assert.equal((await executor.race(bigger)).status, 'exhausted');
+  assert.equal(rpc.attempts, 5);
+  const newProject = { ...bigger, actionId: raceBase.replace('2a:buy', '2b:buy') };
+  for (let round = 1; round <= MAX_SNIPE_ATTEMPTS; round++) {
+    current = await executor.race(newProject);
+    assert.equal(current.attemptActionId, newProject.actionId + ':race:' + round);
+    assert.equal(current.status, 'pending');
+    revert(current);
+  }
+  assert.equal((await executor.race(newProject)).status, 'exhausted');
+  assert.equal(rpc.attempts, 5 + MAX_SNIPE_ATTEMPTS);
+  await assert.rejects(executor({ ...newProject, actionId: newProject.actionId + ':race:12' }), /reserved/);
+});
+
+test('a race closed during signing leaves no reservation or RPC POST', async t => {
+  const wallet = Wallet.createRandom();
+  const slowSigner = { address: wallet.address, async signTransaction(request) {
+    const raw = await wallet.signTransaction(request);
+    closed = true;
+    return raw;
+  } };
+  let closed = false;
+  const rpc = raceRpc();
+  const executor = makeExecutor(opts(rpc, [slowSigner], join(await temp(t), 'race-expired-sign.sqlite'), { directBroadcast: true }));
+  closeAfter.get(t).push(() => executor.close());
+  const request = { actionId: raceBase, wallet, tx: raceTx(wallet), maxAttempts: 6,
+    beforeDispatch() { if (closed) throw new Error('closed in test'); } };
+  await assert.rejects(executor.race(request), /closed in test/);
+  assert.equal(await executor.raceStatus(raceBase, wallet), null);
+  assert.equal(rpc.attempts, 0);
+});
+
 test('definite raw refusal consumes a race attempt but does not reserve its nonce', async t => {
   const wallet = Wallet.createRandom();
   const rpc = raceRpc();
@@ -623,6 +763,34 @@ test('restart cannot lower the original minOut, increase amount, or change the r
   for (const other of [raceTx(wallet, 99n), raceTx(wallet, 100n, 16n),
     raceTx(wallet, 100n, 15n, '0x0000000000000000000000000000000000000011')]) {
     await assert.rejects(executor.race({ ...request, tx: other }), /weakens its original minimum output/);
+  }
+  assert.equal(rpc.attempts, 1);
+  assert.equal((await executor.race(request)).attempt, 2);
+  assert.equal(rpc.attempts, 2);
+});
+
+test('ERC-20 race keeps the original quote asset and principal after restart', async t => {
+  const wallet = Wallet.createRandom();
+  const rpc = raceRpc();
+  const usdt = '0x0000000000000000000000000000000000000035';
+  const other = '0x0000000000000000000000000000000000000036';
+  const options = opts(rpc, [wallet], join(await temp(t), 'erc20-race.sqlite'), { directBroadcast: true });
+  const build = (quoteToken, amountIn = 35_000_000n) =>
+    buildBuy({ amountOutMin: 100n, path: [quoteToken, to] }, wallet.address,
+      { amountIn, quoteToken, deadlineSeconds: 8 }, { number: 42, timestamp: 1794590000 });
+  const request = { actionId: raceBase, wallet, tx: build(usdt), quoteToken: usdt, maxAttempts: 3 };
+  assert.equal(request.tx.value, 0n);
+  const original = makeExecutor(options);
+  const first = await original.race(request);
+  assert.equal(first.status, 'pending');
+  original.close();
+  rpc.receipts.set(first.txHash, receipt(first.txHash, wallet.address, 0));
+  rpc.nonce = rpc.latestNonce = 6;
+  const executor = makeExecutor(options);
+  closeAfter.get(t).push(() => executor.close());
+  for (const change of [{ tx: build(other), quoteToken: other }, { tx: build(usdt, 35_000_001n) },
+    { tx: raceTx(wallet, 100n, 35_000_000n), quoteToken: undefined }]) {
+    await assert.rejects(executor.race({ ...request, ...change }), /weakens its original minimum output/);
   }
   assert.equal(rpc.attempts, 1);
   assert.equal((await executor.race(request)).attempt, 2);

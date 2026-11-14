@@ -9,7 +9,7 @@ const state = {
   projects: [], logs: [], running: false, mode: 'idle', workspace: null, busy: '', starting: false, stopping: false,
   lastError: '', lastErrorWorkspace: null, editing: -1, pendingProjectRemove: null, pendingWalletRemove: null, liveReview: null,
   preview: null, configRevision: '', stateRevision: '', logCursor: '', reloadRequired: '', cancelingStartup: false,
-  snipeReport: '',
+  snipeReport: '', snipeTiming: null,
 };
 const EXPLORER = 'https://bscscan.com';
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -21,7 +21,7 @@ const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const defaults = {
   snipe: { amountBnb: '0.01', walletCount: 1, minLiquidityBnb: '1', slippageBps: 1000, maxOpeningPremiumBps: 1000,
     maxPriceImpactBps: 1000, maxBuyTaxBps: 500, maxSellTaxBps: 500, windowBlocks: 15, deadlineSeconds: 12,
-    scanMs: 350, repeatAttempts: 1, requirePreopen: false },
+    scanMs: 350, broadcastConcurrency: 1, repeatAttempts: 2, requirePreopen: true },
   outer: { maxTotalBnb: '0.5', maxGasPriceGwei: '0.25', gasLimitCap: 10_000_000, pollMs: 1200 },
 };
 const refreshJobs = new Map();
@@ -123,6 +123,7 @@ function decimal(value, decimals, { allowZero = false } = {}) {
 }
 function formatUnits(value, decimals = 18) {
   try {
+    if (decimals === 0) return BigInt(value).toString();
     const s = BigInt(value).toString().padStart(decimals + 1, '0');
     const frac = s.slice(-decimals).replace(/0+$/, '');
     return s.slice(0, -decimals) + (frac ? '.' + frac : '');
@@ -305,7 +306,7 @@ function normalizeConfig(config) {
   };
 }
 function targetsOf(workspace, config = state.config) {
-  return workspace === 'snipe' ? (config?.snipeTargets ?? []).map(url => ({ url }))
+  return workspace === 'snipe' ? (config?.snipeTargets ?? []).map(row => typeof row === 'string' ? { url: row } : row)
     : workspace === 'mint' ? (config?.targets ?? [])
     : [...targetsOf('mint', config), ...targetsOf('snipe', config)];
 }
@@ -314,8 +315,7 @@ function projectSnapshot(url) {
   if (!parsed) return null;
   const row = state.projects.find(p => projectKey(p) === projectKey(parsed) && !p.error);
   const listed = catalog.statuses.get(projectKey(parsed));
-  return catalogQuote(listed).kind === 'native' && Number(listed.block ?? 0) > Number(row?.block ?? 0) ? listed :
-    catalogQuote(row).kind === 'token' ? null : row;
+  return catalogQuote(listed).kind !== 'unknown' && Number(listed.block ?? 0) > Number(row?.block ?? 0) ? listed : row;
 }
 function matchWallets(target, wallets) {
   if (target.mintWallets === undefined) return wallets;
@@ -350,6 +350,7 @@ async function api(path, body) {
   }
   let response;
   const timeout = path === 'start' || path === 'stop' ? 90_000 : ['state', 'status', 'rpc/status'].includes(route) ? 6_000 :
+    path === 'catalog/quote-assets' ? 25_000 :
     ['catalog', 'catalog/status', 'catalog/funding-times'].includes(path) ? 12_000 :
     ['project/participants', 'project/wallet-balances'].includes(path) ? 8_000 : path === 'project/metadata' ? 15_000 : 35_000;
   try {
@@ -907,8 +908,9 @@ function renderProjectList(workspace) {
       link.dataset.projectControl = 'link';
       buttons.append(link);
     }
-    if (!snipe) {
-      const edit = iconAction('edit', '配置 Mint ' + short(parsed?.token), () => openProject(index));
+    if (!snipe || target.quoteToken || validAddress(row?.quoteToken)) {
+      const edit = iconAction('edit', (snipe ? '配置狙击 ' : '配置 Mint ') + short(parsed?.token),
+        () => snipe ? openSnipe(target.url, index) : openProject(index));
       edit.disabled = frozen();
       edit.dataset.projectControl = 'edit';
       buttons.append(edit);
@@ -928,8 +930,10 @@ function renderProjectList(workspace) {
       const minted = catalogInteger(row.mintedLots), total = catalogInteger(row.totalLots);
       if (minted !== null && total !== null && total >= minted) progressText += ' · 剩 ' + fmtInt.format(total - minted) + ' 批';
     }
+    const quote = catalogQuote(row);
+    const priceText = catalogQuoteAmount(catalogInteger(row?.pricePerLot), quote);
     progress.append(element('strong', '', progressText),
-      element('span', '', row?.pricePerLot != null ? formatUnits(row.pricePerLot) + ' BNB / 批' : '等待链上数据'));
+      element('span', '', priceText === '—' ? '等待链上数据' : priceText + ' / 批'));
     const bar = element('progress', 'progress-track' + (row?.launched ? ' launched' : ''));
     bar.max = 100;
     let percentage = 0;
@@ -939,12 +943,16 @@ function renderProjectList(workspace) {
     const flags = element('div', 'project-flags');
     if (snipe) {
       const newLaunchStatus = state.running && state.workspace === 'snipe' ? '开盘 · 查看狙击日志' : '已开盘，不追买';
-      flags.append(badge(row?.launched ? newLaunchStatus : '监控新开盘', row?.launched ? '' : 'violet'));
+      const lastLot = snipeWaitingForLastLot(row);
+      flags.append(badge(row?.launched ? newLaunchStatus : lastLot ? '剩 1 批 · 待末笔 Mint' : '监控新开盘',
+        row?.launched ? '' : lastLot ? 'amber' : 'violet'));
+      if (target.quoteToken) flags.append(badge(target.amountQuote + ' ' + paymentUnit(target) + ' / 钱包'));
     } else {
       if (target.mintBatches) flags.append(badge('每钱包目标 ' + target.mintBatches + ' 批', 'violet'));
       if (row?.maxMintsPerWallet != null) flags.append(badge('链上限额 ' + row.maxMintsPerWallet + ' 批/地址',
         target.mintBatches > Number(row.maxMintsPerWallet) ? 'amber' : ''));
-      if (target.mintBatches) flags.append(badge('价格保护 ≤ ' + target.maxMintPriceBnb + ' BNB/批'));
+      if (target.mintBatches) flags.append(badge('价格保护 ≤ ' + (target.maxMintPriceQuote ?? target.maxMintPriceBnb) +
+        ' ' + paymentUnit(target) + '/批'));
       if (target.autoClaim) flags.append(badge('自动领币', 'green'));
       if (target.mintBatches || target.autoClaim) {
         const count = target.mintWallets?.length ?? state.wallets.length;
@@ -994,12 +1002,14 @@ const eventNames = {
   project: ['项目快照', ''], project_error: ['项目异常', 'red'], rpc_error: ['RPC 异常', 'red'],
   watch_started: ['启动监控', 'violet'], watch_stopped: ['停止监控', ''], watch_error: ['监控异常', 'red'],
   mint: ['Mint', 'violet'], claim: ['自动领币', 'violet'], buy: ['开盘买入', 'violet'],
+  quote_approval: ['支付币授权', 'violet'],
   mint_skipped: ['跳过 Mint', 'amber'], claim_skipped: ['跳过领币', 'amber'], buy_skipped: ['跳过买入', 'amber'],
   journal: ['历史回执', ''], status: ['刷新状态', ''], configured: ['保存配置', ''],
   snipe_detected: ['发现开盘', 'violet'], snipe_feed: ['监听状态', ''],
   snipe_send: ['向 RPC 发单', 'amber'], snipe_ack: ['RPC 已接收', 'violet'],
   snipe_race_mode: ['竞争路径', 'violet'], snipe_race_attempt: ['竞争提交', 'amber'], snipe_race_outcome: ['竞争结果', 'violet'],
   snipe_pending_feed: ['待打包监听', ''], snipe_pending_match: ['提前量对照', ''], snipe_pending: ['发现待打包 Mint', ''],
+  snipe_report_warning: ['运行记录提醒', 'amber'],
 };
 const feedPhases = { ready: '监听已就绪', subscribed: '已订阅', connecting: '连接中',
   connected: '已连接', retrying: '重连中', reconnecting: '重连中', error: '异常', degraded: '回退中',
@@ -1018,7 +1028,7 @@ function renderLogList(workspace) {
   const entries = [...state.logs].reverse().filter(event => {
     const tagged = event.workspace ?? (/^buy/.test(event.event) ? 'snipe' : 'mint');
     if (tagged !== workspace && tagged !== 'all') return false;
-    if (filter === 'trades') return /^(mint|claim|buy|journal|snipe_send|snipe_ack)/.test(event.event);
+    if (filter === 'trades') return /^(mint|claim|buy|quote_approval|journal|snipe_send|snipe_ack)/.test(event.event);
     if (filter === 'errors') return Boolean(event.error || event.event?.endsWith('_skipped') || event.status === 'failed');
     return true;
   }).slice(0, 100);
@@ -1040,6 +1050,10 @@ function renderLogList(workspace) {
     if (entry.wallet) info.push('钱包 ' + short(entry.wallet));
     if (entry.token) info.push('Token ' + short(entry.token));
     else if (entry.mint) info.push('Mint ' + short(entry.mint));
+    if (entry.event === 'quote_approval' && validAddress(entry.quoteToken)) {
+      const amount = catalogInteger(entry.approvalAmount);
+      info.push('支付币 ' + short(entry.quoteToken), '额度 ' + (amount === null ? '—' : formatUnits(amount, entry.quoteDecimals)));
+    }
     if (entry.event === 'project') info.push(entry.mintedLots + '/' + entry.totalLots + ' 批', entry.launched ? '已开盘' : '未开盘');
     if (entry.event === 'mint' && entry.batch) info.push('第 ' + entry.batch + ' 批');
     if (entry.block || entry.armBlock || entry.launchBlock) info.push('#' + (entry.block || entry.armBlock || entry.launchBlock));
@@ -1048,6 +1062,12 @@ function renderLogList(workspace) {
     if (entry.event === 'snipe_feed' && entry.retryMs) info.push('延迟 ' + entry.retryMs + ' ms 后重试');
     if (entry.raceMode) info.push(entry.raceMode === 'pending' ? '开盘前准备' : '确认后');
     if (Number.isSafeInteger(entry.attempt)) info.push('第 ' + entry.attempt + ' 次');
+    if (entry.event === 'snipe_send' && Number.isSafeInteger(entry.broadcastConcurrency)) {
+      info.push('并发上限 ' + entry.broadcastConcurrency + ' 个 RPC');
+    }
+    if (entry.event === 'snipe_ack' && Number.isSafeInteger(entry.broadcastRpcCount)) {
+      info.push('已投递 ' + entry.broadcastRpcCount + ' 个 RPC');
+    }
     if (Number.isFinite(entry.leadMs)) info.push('比本地开盘通知早 ' + entry.leadMs + ' ms');
     if (entry.pendingMode && entry.event === 'snipe_pending_feed') info.push(entry.pendingMode);
     if (Number.isFinite(entry.quoteMs)) info.push('发现→验池报价 ' + entry.quoteMs + ' ms');
@@ -1124,15 +1144,16 @@ function canRefresh(workspace) {
 function snipeProgressVisible() {
   return currentView === 'snipe' && document.visibilityState === 'visible' && canRefresh('snipe');
 }
+function snipeWaitingForLastLot(row) {
+  if (!row || row.error || row.refreshError || row.launched || row.emergencyWithdrawn || row.phase !== 1) return false;
+  const deadline = catalogTimestamp(row.fundingDeadline);
+  if (deadline && deadline <= Date.now() / 1000) return false;
+  const minted = catalogInteger(row.mintedLots), total = catalogInteger(row.totalLots);
+  return minted !== null && total !== null && total - minted === 1n;
+}
 function snipeProgressNearFull() {
   const keys = new Set(targetsOf('snipe').map(target => projectKey(parsedTarget(target) ?? {})).filter(Boolean));
-  return state.projects.some(row => {
-    if (!keys.has(projectKey(row)) || row.error || row.refreshError || row.launched || row.emergencyWithdrawn || row.phase === 2) return false;
-    const deadline = catalogTimestamp(row.fundingDeadline);
-    if (deadline && deadline <= Date.now() / 1000) return false;
-    const minted = catalogInteger(row.mintedLots), total = catalogInteger(row.totalLots);
-    return minted !== null && total !== null && total - minted === 1n;
-  });
+  return state.projects.some(row => keys.has(projectKey(row)) && snipeWaitingForLastLot(row));
 }
 function resumeSnipeProgress(immediate = true) {
   clearTimeout(snipeProgressTimer);
@@ -1244,7 +1265,11 @@ function renderControls() {
   }
   $('config-source').textContent = !state.config ? '—' : state.source === 'local' ? '本地配置' : '内置示例';
   $('claim-count').textContent = state.config ? String(targetsOf('mint').filter(t => t.autoClaim).length) : '—';
-  $('snipe-amount-label').textContent = state.config ? (state.config.snipe?.amountBnb ?? defaults.snipe.amountBnb) + ' BNB' : '—';
+  const targets = targetsOf('snipe');
+  const hasTokenQuote = targets.some(target => validAddress(target.quoteToken));
+  $('snipe-amount-label').textContent = !state.config ? '—' : !hasTokenQuote ?
+    (state.config.snipe?.amountBnb ?? defaults.snipe.amountBnb) + ' BNB' :
+    targets.length === 1 ? targets[0].amountQuote + ' ' + paymentUnit(targets[0]) : '按项目设置';
   $('snipe-wallet-count').textContent = state.config ? String(state.config.snipe?.walletCount ?? defaults.snipe.walletCount) : '—';
   $('snipe-report-row').hidden = !state.snipeReport;
   $('snipe-report-path').textContent = state.snipeReport;
@@ -1293,8 +1318,10 @@ function catalogPhase(status, now, failed = false) {
     ['unknown', '状态暂未读到', 'amber'] : ['unknown', '读取状态…', ''];
   if (status.launched) return ['launched', '已开盘', 'green'];
   const deadline = catalogTimestamp(status.fundingDeadline);
-  if (status.emergencyWithdrawn || status.phase === 2 || (deadline && deadline <= now)) return ['ended', '已结束', ''];
-  if (catalogProgress(status) === 1000) return ['funded', '已铸满 · 待开盘', 'violet'];
+  if (!status.emergencyWithdrawn && [4, 5].includes(status.phase)) return ['ended', '退款期', ''];
+  if (status.emergencyWithdrawn || status.phase === 6) return ['ended', '已结束', ''];
+  if (status.phase === 2 || catalogProgress(status) === 1000) return ['funded', '已铸满 · 待开盘', 'violet'];
+  if (deadline && deadline <= now) return ['ended', '已结束', ''];
   if (deadline && deadline - now <= CATALOG_ENDING_SEC) return ['ending', '即将结束', 'amber'];
   return ['funding', '筹资中', 'amber'];
 }
@@ -1381,6 +1408,11 @@ function catalogQuote(status) {
 function catalogQuoteAmount(value, quote) {
   if (value === null || quote.decimals == null) return '—';
   return (quote.decimals === 0 ? value.toString() : formatUnits(value, quote.decimals)) + ' ' + quote.unit;
+}
+function paymentUnit(row) {
+  if (!validAddress(row?.quoteToken)) return 'BNB';
+  const snap = projectSnapshot(row.url);
+  return catalogQuote(same(snap?.quoteToken, row.quoteToken) ? snap : row).unit ?? short(row.quoteToken);
 }
 function catalogQuery(value) { return String(value ?? '').normalize('NFKC').trim().toLowerCase(); }
 function catalogMatches(row, query) {
@@ -1489,10 +1521,8 @@ function catalogCard(row, display) {
   lower.append(timing);
   if (mode) lower.append(badge(mode, mode === '公开 Mint' ? 'green' : 'amber'));
   const actions = element('div', 'catalog-actions');
-  if (quote.kind !== 'native') {
-    const note = quote.kind === 'token' ? quote.unit + ' 代币支付 · 仅供查看' : '支付币种待核验 · 暂不可操作';
-    const readOnly = element('p', 'catalog-action-note', note);
-    if (quote.kind === 'token') readOnly.title = '本工具只支持 BNB 支付项目的 Mint、领币和狙击。';
+  if (quote.kind === 'unknown' || (quote.kind === 'token' && (!quote.address || quote.decimals == null) && kind !== 'launched')) {
+    const readOnly = element('p', 'catalog-action-note', '支付币种或精度待核验 · 暂不可操作');
     actions.append(readOnly);
     card.append(head, description, stats, progress, lower, actions);
     return card;
@@ -1508,12 +1538,11 @@ function catalogCard(row, display) {
   snipe.type = 'button';
   snipe.dataset.catalogAction = 'snipe';
   setButton(snipe, hasSnipe ? '已在狙击名单' : '加入狙击', 'bolt');
-  snipe.disabled = disabled || hasSnipe || !['funding', 'ending', 'funded'].includes(kind);
-  if (!hasSnipe && snipe.disabled && ['launched', 'ended', 'unknown'].includes(kind)) snipe.title = '只有尚未开盘且可核验的目标可加入狙击';
+  snipe.disabled = disabled || hasSnipe || !['funding', 'ending'].includes(kind);
   snipe.addEventListener('click', () => openSnipe(row.url));
-  if (kind === 'ended' && mintIndex < 0) actions.append(element('p', 'catalog-action-note', '已结束，不能再 Mint'));
+  if (kind === 'ended' && mintIndex < 0) actions.append(element('p', 'catalog-action-note', '本地仅在常规筹资阶段提交 Mint'));
   else actions.append(mint);
-  if (['funding', 'ending', 'funded'].includes(kind)) actions.append(snipe);
+  if (['funding', 'ending'].includes(kind)) actions.append(snipe);
   card.append(head, description, stats, progress, lower, actions);
   return card;
 }
@@ -1564,6 +1593,66 @@ function updateCatalogCards(list, entries, now) {
 function catalogText(id, text) {
   if ($(id).textContent !== text) $(id).textContent = text;
 }
+let quoteDirectoryRequest = null;
+let quoteDirectorySnapshot = null;
+let quoteDirectoryIssue = '';
+function renderQuoteDirectory() {
+  const snapshot = quoteDirectorySnapshot;
+  const summary = $('catalog-quote-summary');
+  const list = $('catalog-quote-list');
+  if (!snapshot) {
+    summary.textContent = quoteDirectoryRequest ? '正在核验 Flap Portal 与 Corla 工厂…' : quoteDirectoryIssue;
+    return;
+  }
+  const enabled = snapshot.assets.filter(row => row.status === 'enabled');
+  const pending = snapshot.assets.filter(row => row.status === 'unverified' || row.status === 'unknown').length;
+  const prefix = quoteDirectoryRequest ? '正在刷新，保留上次结果 · ' :
+    quoteDirectoryIssue ? quoteDirectoryIssue + ' 显示上次结果 · ' :
+    snapshot.stale ? '链上查询失败，显示上次结果 · ' : '';
+  summary.textContent = prefix +
+    (snapshot.directoryStale ? '候选目录更新失败 · ' : '') + '区块 #' + fmtInt.format(snapshot.block) + ' · ' +
+    enabled.length + ' 个已开放 / ' + snapshot.assets.length + ' 个候选' + (pending ? ' · ' + pending + ' 个待核验' : '');
+  const selected = $('catalog-quote-filter').value === 'all' ? snapshot.assets : enabled;
+  const labels = { enabled: '已开放', disabled: '未开放', unverified: '工厂或精度待核验', unknown: '链上状态未读到' };
+  if (!selected.length) {
+    list.replaceChildren(element('li', 'hint', pending ? '部分底池待核验，可切到「全部候选」查看。' : '当前筛选没有结果。'));
+    return;
+  }
+  list.replaceChildren(...selected.map(({ address, symbol, status, category, decimals }) => {
+    const item = element('li', 'quote-directory-item');
+    const name = element('strong', '', symbol);
+    const detail = address === ZERO_ADDRESS ? element('span', 'hint', 'BSC 原生币') :
+      external(EXPLORER + '/token/' + address, 'mono', address);
+    item.append(name, detail, element('span', 'hint', (category === 'stocks' ? '币股／商品' : '常用') +
+      ' · ' + decimals + ' 位'), badge(labels[status], status === 'enabled' ? 'green' : ''));
+    return item;
+  }));
+}
+async function loadQuoteDirectory() {
+  if (quoteDirectoryRequest) return;
+  if (!state.session || state.reloadRequired) {
+    quoteDirectoryIssue = '请先刷新页面，重新连接本地服务。';
+    renderQuoteDirectory();
+    return;
+  }
+  const refresh = $('catalog-quote-refresh');
+  refresh.disabled = true;
+  quoteDirectoryIssue = '';
+  quoteDirectoryRequest = api('catalog/quote-assets', {});
+  renderQuoteDirectory();
+  try {
+    const snapshot = await quoteDirectoryRequest;
+    if (!Number.isSafeInteger(snapshot?.block) || !Array.isArray(snapshot.assets)) throw new Error('底池目录数据不完整');
+    quoteDirectorySnapshot = snapshot;
+  } catch (e) {
+    quoteDirectoryIssue = e?.status === 404 ? '本地后台尚未加载底池接口，请重启 Corla 再刷新页面。' :
+      e?.code === 'SESSION_EXPIRED' ? '本地会话已失效，请刷新页面重新连接。' : '底池目录查询失败，可点「查询链上」重试。';
+  } finally {
+    quoteDirectoryRequest = null;
+    refresh.disabled = false;
+    renderQuoteDirectory();
+  }
+}
 function renderDiscover() {
   if ($('view-discover').hidden || catalogPaintQueued) return;
   catalogPaintQueued = true;
@@ -1601,7 +1690,7 @@ function paintDiscover() {
   catalogText('catalog-live-label', !active ? (state.session ? '已暂停' : '自动连接中') :
     catalog.failures ? '自动重试中' : catalog.loaded ? '自动更新' : '正在同步');
   $('catalog-live-dot').className = 'dot ' + (catalog.failures ? 'stopping' : active && catalog.loaded ? 'ready' : '');
-  catalogText('catalog-updated', catalog.lastUpdated ? '最近同步 ' + fmtTime.format(new Date(catalog.lastUpdated)) +
+  catalogText('catalog-updated', catalog.lastUpdated ? '同步于 ' + fmtTime.format(new Date(catalog.lastUpdated)) +
     (catalog.lastBlock ? ' · 区块 #' + fmtInt.format(catalog.lastBlock) : '') : '尚未同步');
   const warning = catalog.error || catalog.statusError || (lookup?.error ?? '');
   catalogText('catalog-notice', warning);
@@ -2121,6 +2210,7 @@ function paintMintWalletFunding(qty, validQty, claim) {
   const balanceProject = mintBalanceRead.project;
   const preview = key && projectKey(state.preview ?? {}) === key ? state.preview : null;
   const project = fresh && balanceProject ? balanceProject : preview;
+  const quote = catalogQuote(project);
   let gasWei;
   try { gasWei = mintWalletGasReserve(); } catch { /* Unknown gas configuration cannot qualify a wallet. */ }
   let sufficient = 0, missingBalance = 0;
@@ -2151,20 +2241,24 @@ function paintMintWalletFunding(qty, validQty, claim) {
     if (funding.status === 'sufficient') sufficient++;
     if (mintWalletAuto) input.checked = funding.status === 'sufficient';
     node.dataset.funding = funding.status;
-    amount.textContent = missing ? '—' : walletBalanceText(balance);
+    const quoteBalance = catalogInteger(row?.quoteBalance);
+    amount.textContent = missing ? '—' : quote.kind === 'token' ?
+      catalogQuoteAmount(quoteBalance, quote) + ' / ' + walletBalanceText(balance) : walletBalanceText(balance);
     const tips = [];
     if (balance !== null) tips.push('余额 ' + formatUnits(balance) + ' BNB');
     if (funding.needWei !== null) tips.push('需预留 ' + formatUnits(funding.needWei) + ' BNB（含 Gas）');
+    if (funding.needQuote !== undefined) tips.push('Mint 本金 ' + catalogQuoteAmount(funding.needQuote, quote));
+    if (quote.kind === 'token' && row?.quoteAllowance != null) tips.push('工厂已授权 ' + catalogQuoteAmount(catalogInteger(row.quoteAllowance), quote));
     amount.title = tips.join('；');
-    result.textContent = missing ? '不在钱包库' : funding.status === 'sufficient' ? '余额足够' :
+    result.textContent = missing ? '不在钱包库' : funding.status === 'sufficient' ? (funding.approvalNeeded ? '余额足够 · 待授权' : '余额足够') :
       funding.status === 'insufficient' ? '余额不足' : funding.status === 'idle' ? '无待执行动作' :
       !fresh && balance !== null ? '余额待刷新' : balance === null ? '余额未读到' : '待核对项目';
   }
   $('project-wallet-sufficient').disabled = !sufficient;
   $('project-wallet-refresh').disabled = mintBalanceRead.loading || !state.wallets.length;
   const snapshot = '区块 #' + fmtInt.format(mintBalanceRead.block);
-  $('project-wallet-balance-status').textContent = !state.wallets.length ? '导入钱包后可读取 BNB 余额。' :
-    mintBalanceRead.loading ? '正在读取 BNB 余额…' : mintBalanceRead.failed ? '余额读取失败，可刷新重试。' :
+  $('project-wallet-balance-status').textContent = !state.wallets.length ? '导入钱包后可读取支付币及 BNB 余额。' :
+    mintBalanceRead.loading ? '正在读取链上余额…' : mintBalanceRead.failed ? '余额读取失败，可刷新重试。' :
       fresh ? snapshot + ' · ' + sufficient + ' 个余额足够' + (missingBalance ? ' · ' + missingBalance + ' 个余额未读到' : '') :
         mintBalanceRead.at ? '余额快照已过期，请刷新。' : '等待链上余额快照…';
 }
@@ -2208,9 +2302,13 @@ function updateMintFields() {
   try {
     const mint = qty > 0 ? verifiedMintPrice(state.preview) : 0n;
     const gas = mintWalletGasReserve();
-    const ceiling = BigInt(walletCount) * (BigInt(qty) * (mint + gas) + (claim ? gas : 0n));
+    const quote = catalogQuote(state.preview);
+    const erc20 = quote.kind === 'token' && qty > 0;
+    const ceiling = BigInt(walletCount) * (BigInt(qty) * ((erc20 ? 0n : mint) + gas) +
+      (claim ? gas : 0n) + (erc20 ? 2n * gas : 0n));
     estimate.textContent = (qty > 0 ? '最多新增 ' + (walletCount * effective) + ' 批 · ' : '') +
-      '预算预留上限 ' + formatUnits(ceiling) + ' BNB（含 Gas）' +
+      (erc20 ? '本金 ≤ ' + catalogQuoteAmount(BigInt(walletCount) * BigInt(qty) * mint, quote) + ' · ' : '') +
+      '预留 ≤ ' + formatUnits(ceiling) + ' BNB（含 Gas）' +
       (effective < qty ? ' · 链上限额将把实际每地址目标降到 ' + effective + ' 批' : '');
   } catch { estimate.textContent = '读取合约的每批应付金额后显示预算预留上限。'; }
 }
@@ -2226,15 +2324,17 @@ function verifiedMintPrice(project, target) {
 }
 function showMintPreview(project) {
   state.preview = project;
-  let price;
-  try { price = formatUnits(verifiedMintPrice(project)); } catch { /* No verified quote yet. */ }
+  const price = catalogQuoteAmount(catalogInteger(project?.pricePerLot), catalogQuote(project));
   const lots = project?.tokensPerLot == null ? null : formatUnits(project.tokensPerLot);
   const cap = project?.maxMintsPerWallet;
-  $('project-price').textContent = price ? price + ' BNB' : '等待读取';
+  $('project-price').textContent = price === '—' ? '等待读取' : price;
   $('project-preview').textContent = project ? [
     lots && lots !== '—' ? '每批份额 ' + lots + ' 枚' : null,
     cap != null ? '链上限额 ' + cap + ' 批 / 地址' : null,
     project.launched ? '已开盘（仅可领取）' : null,
+    project.poolRoute === 'pancake-v2' ? 'PancakeSwap V2 直连池' : null,
+    project.quoteEnabled === false ? 'Flap 目前未开放该底池' : null,
+    project.poolRoute === null || project.quoteEnabled === null ? '底池待核验，可重新读取' : null,
   ].filter(Boolean).join(' · ') || '已读取链上参数。' : '粘贴链接后自动读取每批应付金额和限额。';
   updateMintFields();
 }
@@ -2251,7 +2351,9 @@ async function fetchMintPreview({ force = false } = {}) {
   const snapshot = projectSnapshot(parsed.url);
   const existing = projectKey(state.preview ?? {}) === projectKey(parsed) ? state.preview : null;
   const cached = Number(existing?.block ?? 0) >= Number(snapshot?.block ?? 0) ? existing ?? snapshot : snapshot;
-  if (cached && !force) { showMintPreview(cached); $('project-preview-button').disabled = false; return; }
+  if (cached && !force && (cached.launched || cached.phase === 2 || cached.poolRoute)) {
+    showMintPreview(cached); $('project-preview-button').disabled = false; return;
+  }
   $('project-preview').textContent = '正在读取链上参数…';
   $('project-preview-button').disabled = true;
   const current = () => id === previewSequence && $('project-dialog').open && !state.reloadRequired;
@@ -2346,7 +2448,19 @@ async function submitProject(event) {
     }
     if (target.mintBatches) {
       // Keep the saved amount as a fail-closed spending guard, not a bid.
-      target.maxMintPriceBnb = formatUnits(verifiedMintPrice(state.preview, parsed));
+      if (state.preview?.quoteEnabled === false || state.preview?.poolRoute === 'unsupported') {
+        throw new Error('该项目底池在 Flap 未开放，或不是当前支持的 PancakeSwap V2 直连池。');
+      }
+      if (state.preview?.quoteEnabled !== true || state.preview?.poolRoute !== 'pancake-v2') {
+        throw new Error('请先读取并核验项目底池，再保存 Mint 配置。');
+      }
+      const price = verifiedMintPrice(state.preview, parsed);
+      const quote = catalogQuote(state.preview);
+      if (quote.kind === 'native') target.maxMintPriceBnb = formatUnits(price);
+      else if (quote.kind === 'token' && quote.address && quote.decimals !== null) {
+        Object.assign(target, { quoteToken: quote.address, quoteDecimals: quote.decimals,
+          maxMintPriceQuote: formatUnits(price, quote.decimals) });
+      } else throw new Error('请先读取链上的支付币地址和精度。');
     }
     if (state.editing >= 0) config.targets[state.editing] = target;
     else config.targets.push(target);
@@ -2363,12 +2477,53 @@ async function submitProject(event) {
     reviewLive('mint');
   } else if (saved) void refresh({ silent: true, workspace: 'mint' });
 }
-function openSnipe(discoveredUrl = '') {
+let snipeQuotePreview, snipeQuoteSequence = 0, snipeEditIndex = -1, snipeQuoteTimer;
+async function loadSnipeQuote() {
+  clearTimeout(snipeQuoteTimer);
+  const sequence = ++snipeQuoteSequence;
+  const url = $('snipe-url').value.trim();
+  const status = $('snipe-quote-status');
+  snipeQuotePreview = null;
+  $('snipe-quote-fields').hidden = true;
+  if (!parsedTarget({ url })) { status.textContent = '读取项目的链上支付币。'; return null; }
+  status.textContent = '正在读取链上支付币…';
+  try {
+    const { project } = await api('project/preview', { url });
+    if (sequence !== snipeQuoteSequence || !$('snipe-add-dialog').open) return null;
+    const quote = catalogQuote(project);
+    if (quote.kind === 'unknown' || (quote.kind === 'token' && (!quote.address || quote.decimals === null))) {
+      throw new Error('支付币地址或精度还未读到，请重试。');
+    }
+    if (project.launched || project.emergencyWithdrawn || [4, 5, 6].includes(project.phase)) {
+      throw new Error('该项目已开盘、结束或进入退款期；本地仅狙击常规筹资阶段。');
+    }
+    if (project.phase === 2) throw new Error('该项目已铸满；本地末笔 Mint 触发窗口已过。');
+    if (project.quoteEnabled === false || project.poolRoute === 'unsupported') {
+      throw new Error('该项目底池在 Flap 未开放，或不是当前支持的 PancakeSwap V2 直连池。');
+    }
+    if (project.quoteEnabled !== true || project.poolRoute !== 'pancake-v2') throw new Error('还未核验项目底池，请重试。');
+    status.textContent = quote.kind === 'token'
+      ? '支付币：' + quote.unit + '（' + quote.address + '）。PancakeSwap V2 直连；Gas 仍用 BNB。'
+      : '支付币：BNB。PancakeSwap V2 直连，使用狙击参数中的 BNB 买入额和最低储备。';
+    for (const id of ['snipe-quote-unit', 'snipe-quote-liquidity-unit']) $(id).textContent = quote.unit;
+    $('snipe-quote-fields').hidden = quote.kind !== 'token';
+    snipeQuotePreview = { url, quote };
+    return snipeQuotePreview;
+  } catch (e) { if (sequence === snipeQuoteSequence) status.textContent = e.message; return null; }
+}
+function openSnipe(discoveredUrl = '', index = -1) {
   if (!state.config || frozen()) return;
+  snipeEditIndex = index;
+  const editing = targetsOf('snipe')[index];
+  $('snipe-add-title').textContent = editing ? '配置狙击目标' : '添加狙击目标';
   $('snipe-url').value = discoveredUrl;
+  $('snipe-url').readOnly = Boolean(editing);
+  $('snipe-quote-amount').value = editing?.amountQuote ?? '';
+  $('snipe-quote-liquidity').value = editing?.minLiquidityQuote ?? '';
   setNotice('snipe-add-error', '');
   $('snipe-add-dialog').showModal();
   $('snipe-url').focus();
+  void loadSnipeQuote();
 }
 async function submitSnipe(event) {
   event.preventDefault();
@@ -2378,19 +2533,37 @@ async function submitSnipe(event) {
   try {
     let parsed;
     try { parsed = parseLink($('snipe-url').value.trim()); } catch { throw new Error('请粘贴有效的 Corla v4 Mint 链接。'); }
+    const url = $('snipe-url').value.trim();
+    const editingIndex = snipeEditIndex;
+    const revision = state.configRevision;
+    const proof = snipeQuotePreview?.url === url ? snipeQuotePreview : await loadSnipeQuote();
+    if (frozen() || !$('snipe-add-dialog').open || url !== $('snipe-url').value.trim() || editingIndex !== snipeEditIndex) return;
+    if (state.configRevision !== revision) throw new Error('配置已更新，请重新核对项目。');
+    if (!proof) throw new Error('请先核对狙击目标的链上支付币。');
     const config = configCopy();
-    if (targetsOf('snipe', config).some(target => same(parsedTarget(target)?.mint, parsed.mint) || same(parsedTarget(target)?.token, parsed.token))) {
+    if (targetsOf('snipe', config).some((target, i) => i !== editingIndex &&
+        (same(parsedTarget(target)?.mint, parsed.mint) || same(parsedTarget(target)?.token, parsed.token)))) {
       throw new Error('该项目已在狙击名单。');
     }
-    if (config.snipeTargets.length >= 32) throw new Error('最多添加 32 个狙击目标。');
-    config.snipeTargets.push(parsed.url);
+    if (editingIndex < 0 && config.snipeTargets.length >= 32) throw new Error('最多添加 32 个狙击目标。');
+    const { quote } = proof;
+    let savedTarget = parsed.url;
+    if (quote.kind === 'token') {
+      const amountQuote = $('snipe-quote-amount').value.trim();
+      const minLiquidityQuote = $('snipe-quote-liquidity').value.trim();
+      decimal(amountQuote, quote.decimals);
+      decimal(minLiquidityQuote, quote.decimals);
+      savedTarget = { url: parsed.url, quoteToken: quote.address, quoteDecimals: quote.decimals, amountQuote, minLiquidityQuote };
+    }
+    if (editingIndex >= 0) config.snipeTargets[editingIndex] = savedTarget;
+    else config.snipeTargets.push(savedTarget);
     config.snipe = { ...defaults.snipe, ...config.snipe };
     setBusy('config');
     await saveConfig(config);
     saved = true;
     $('snipe-add-dialog').close();
     location.hash = 'snipe';
-    notify('已加入狙击名单。');
+    notify(editingIndex >= 0 ? '狙击项目已更新。' : '已加入狙击名单。');
   } catch (e) { setNotice('snipe-add-error', e.message); }
   finally { setBusy(); }
   if (saved) void refresh({ silent: true, workspace: 'snipe' });
@@ -2565,19 +2738,29 @@ async function rememberLocalWalletUnlock(event) {
 }
 function worstBudget(cfg, wallets, workspace) {
   const gas = BigInt(cfg.gasLimitCap ?? 10_000_000) * decimal(cfg.maxGasPriceGwei ?? '1', 9);
+  let total = 0n;
+  const approvals = new Set();
   if (workspace === 'snipe') {
     const buyers = BigInt(cfg.snipe.walletCount ?? 1);
     if (buyers > BigInt(wallets.length)) throw new Error('买入钱包数超出可用实盘钱包数。');
-    return BigInt(cfg.snipeTargets.length) * buyers * BigInt(cfg.snipe.repeatAttempts ?? 1) * (gas + decimal(cfg.snipe.amountBnb, 18));
+    for (const target of targetsOf('snipe', cfg)) {
+      if (target.quoteToken) approvals.add(target.quoteToken.toLowerCase());
+      total += buyers * BigInt(cfg.snipe.repeatAttempts ?? 1) *
+        (gas + (target.quoteToken ? 0n : decimal(cfg.snipe.amountBnb, 18)));
+    }
+    return total + 2n * gas * buyers * BigInt(approvals.size);
   }
-  let total = 0n;
   for (const target of cfg.targets) {
     if (!target.mintBatches && !target.autoClaim) continue;
-    const n = BigInt(matchWallets(target, wallets).length);
-    if (target.mintBatches) total += n * BigInt(target.mintBatches) * (gas + decimal(target.maxMintPriceBnb, 18));
+    const selected = matchWallets(target, wallets);
+    const n = BigInt(selected.length);
+    if (target.mintBatches) {
+      total += n * BigInt(target.mintBatches) * (gas + (target.quoteToken ? 0n : decimal(target.maxMintPriceBnb, 18)));
+      if (target.quoteToken) for (const wallet of selected) approvals.add((target.quoteToken + ':' + wallet).toLowerCase());
+    }
     if (target.autoClaim) total += n * gas;
   }
-  return total;
+  return total + 2n * gas * BigInt(approvals.size);
 }
 function readParameters(form, defaultsGroup) {
   const values = new FormData(form);
@@ -2604,21 +2787,40 @@ function readParameters(form, defaultsGroup) {
   }
   return result;
 }
+function snipeAttemptLimit() {
+  const limit = state.snipeTiming?.maxAttempts;
+  // A running older service still has the previous cap until it is restarted.
+  return Number.isSafeInteger(limit) && limit >= 2 ? limit : 5;
+}
 function snipeOpeningPolicyError(fields) {
   if (fields.requirePreopen.indeterminate) return '保存的「没抢到开盘就不追」设置无效，请重新选择。';
-  if (fields.requirePreopen.checked && (!UINT.test(fields.repeatAttempts.value) ||
-      Number(fields.repeatAttempts.value) < 2 || Number(fields.repeatAttempts.value) > 5)) {
-    return '已开启「没抢到开盘就不追」，请把「每项目每钱包最多提交」设为 2–5 次。';
-  }
+  const { value } = fields.repeatAttempts;
+  if (!value) return '';
+  const min = fields.requirePreopen.checked ? 2 : 1, max = snipeAttemptLimit();
+  if (!UINT.test(value) || Number(value) < min || Number(value) > max) return '请把「并发次数」设为 ' + min + '–' + max + ' 轮。';
   return '';
+}
+function snipeDurationText(attempts) {
+  if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > snipeAttemptLimit()) return '';
+  const ms = attempts === 1 ? state.snipeTiming?.rpcTimeoutMs : state.snipeTiming?.retryWindowMs;
+  if (!Number.isSafeInteger(ms) || ms < 1) return '';
+  return attempts === 1
+    ? '本次并发：开盘确认后尝试 1 轮，发出请求后最多等 ' + ms / 1000 + ' 秒 RPC 应答，链上确认另计。'
+    : '本次并发：最多 ' + attempts + ' 轮，从首轮尝试提交开始共用 ' + ms / 1000 +
+      ' 秒重试窗口，到期不再开新一轮；等待末笔 Mint 的时间另计。';
 }
 function syncSnipeOpeningPolicy() {
   const fields = $('snipe-form').elements;
   const message = $('snipe-preopen-error');
   const issue = snipeOpeningPolicyError(fields);
   fields.repeatAttempts.min = fields.requirePreopen.checked ? '2' : '1';
+  fields.repeatAttempts.max = String(snipeAttemptLimit());
   message.textContent = issue;
   message.hidden = !issue;
+  const preview = $('snipe-duration');
+  const text = !issue && UINT.test(fields.repeatAttempts.value) ? snipeDurationText(Number(fields.repeatAttempts.value)) : '';
+  if (preview.textContent !== text) preview.textContent = text;
+  preview.hidden = !text;
 }
 function reviewLive(workspace) {
   if (!liveAvailable(workspace) || frozen()) return;
@@ -2658,9 +2860,11 @@ function reviewLive(workspace) {
   const projects = element('ul');
   for (const target of targetsOf(workspace, config)) {
     const choices = [];
-    if (snipe) choices.push('开盘买入 ' + settings.amountBnb + ' BNB × ' + settings.walletCount + ' 钱包');
+    if (snipe) choices.push('开盘买入 ' + (target.amountQuote ?? settings.amountBnb) + ' ' + paymentUnit(target) +
+      ' × ' + settings.walletCount + ' 钱包' + (target.quoteToken ? '，最低池储备 ' + target.minLiquidityQuote + ' ' + paymentUnit(target) : ''));
     else {
-        if (target.mintBatches) choices.push('每钱包目标 ' + target.mintBatches + ' 批（受链上限制）；按链上单批价付款，超过保存价 ' + target.maxMintPriceBnb + ' BNB 不发单');
+        if (target.mintBatches) choices.push('每钱包目标 ' + target.mintBatches + ' 批（受链上限制）；单批上限 ' +
+          (target.maxMintPriceQuote ?? target.maxMintPriceBnb) + ' ' + paymentUnit(target));
       if (target.autoClaim) choices.push('开盘后自动领币');
       if (choices.length) {
         choices.push((target.mintWallets?.length ?? wallets.length) + ' 个参与钱包');
@@ -2670,6 +2874,7 @@ function reviewLive(workspace) {
     if (choices.length) {
       const item = element('li');
       item.append(element('code', '', parsedTarget(target)?.token ?? '未知地址'), document.createTextNode(' · ' + choices.join(' / ')));
+      if (target.quoteToken) item.append(element('small', 'mono', ' · 支付币合约 ' + target.quoteToken));
       projects.append(item);
     }
   }
@@ -2677,11 +2882,18 @@ function reviewLive(workspace) {
     element('h3', '', '费用与限制'),
     element('p', '', '预算预留（含 Gas）：' + (total === undefined ? '—' : formatUnits(total)) + ' BNB / 配置上限 ' + (config.maxTotalBnb || '—') + ' BNB'),
     element('p', '', 'Gas 上限：' + (config.maxGasPriceGwei ?? '1') + ' Gwei × ' + (config.gasLimitCap ?? 10_000_000)));
+  if (targetsOf(workspace, config).some(target => target.quoteToken && (snipe || target.mintBatches))) {
+    $('live-summary').append(element('p', '', '支付币本金以各项目所列金额为上限，与 BNB 预算分开。额度不足时，启动前会给 Corla 工厂（Mint）或 Pancake V2 Router（狙击）授权；已有但不足的额度先清零。授权上限按同币种、同钱包的买入额或计划 Mint 本金合计，不做无限授权。停止不会撤销额度。'));
+  }
   if (snipe) {
     const attempts = settings.repeatAttempts ?? 1;
+    $('live-summary').append(element('p', '', '并发线程数：' + settings.broadcastConcurrency + '。同一笔买单每轮最多投给 ' +
+      settings.broadcastConcurrency + ' 个健康 RPC，不会重复扣买入本金。'));
+    const duration = !error && snipeDurationText(attempts);
+    if (duration) $('live-summary').append(element('p', '', duration));
     $('live-summary').append(element('p', '', (attempts > 1
-      ? '竞争模式：每项目每钱包最多提交 ' + attempts + ' 次。末笔 Mint 可核验时会提前发单，回退会消耗 Gas；按次数预留本金和 Gas。'
-      : '单次模式：首次有效开盘每钱包只尝试一次。') + ' 开盘窗口：' + settings.windowBlocks + ' 区块；最低储备：' +
+      ? '竞争模式：每项目每钱包最多 ' + attempts + ' 轮。末笔 Mint 可核验时会提前发单，回退会消耗 Gas；按轮预留 Gas。'
+      : '单次模式：首次有效开盘每钱包只尝试一次。') + ' 开盘窗口：' + settings.windowBlocks + ' 区块；BNB 项目最低储备：' +
       settings.minLiquidityBnb + ' WBNB；当前报价滑点上限：' + settings.slippageBps / 100 + '%；买税 / 卖税上限：' +
       settings.maxBuyTaxBps + ' / ' + settings.maxSellTaxBps + ' bps。'));
     $('live-summary').append(element('p', '', '开盘价溢价上限：' + settings.maxOpeningPremiumBps / 100 +
@@ -2824,7 +3036,25 @@ async function stopWorkspace(workspace) {
 }
 $('add-project').addEventListener('click', () => openProject(-1));
 $('add-snipe').addEventListener('click', () => openSnipe());
+$('catalog-quote-open').addEventListener('click', () => {
+  $('catalog-quote-dialog').showModal();
+  void loadQuoteDirectory();
+});
+$('catalog-quote-filter').addEventListener('change', renderQuoteDirectory);
+$('catalog-quote-refresh').addEventListener('click', loadQuoteDirectory);
 $('snipe-add-form').addEventListener('submit', submitSnipe);
+$('snipe-url').addEventListener('input', () => {
+  snipeQuoteSequence++;
+  snipeQuotePreview = null;
+  $('snipe-quote-fields').hidden = true;
+  $('snipe-quote-amount').value = '';
+  $('snipe-quote-liquidity').value = '';
+  $('snipe-quote-status').textContent = '等待核验链上支付币…';
+  clearTimeout(snipeQuoteTimer);
+  snipeQuoteTimer = setTimeout(() => {
+    if ($('snipe-add-dialog').open) void loadSnipeQuote();
+  }, 250);
+});
 $('project-url').addEventListener('input', scheduleMintPreview);
 $('project-preview-button').addEventListener('click', () => fetchMintPreview({ force: true }));
 $('project-batches').addEventListener('input', () => {
@@ -2951,6 +3181,7 @@ async function boot() {
   try {
     const data = await api('bootstrap');
     state.config = normalizeConfig(data.config);
+    state.snipeTiming = data.snipeTiming;
     state.source = data.source;
     state.session = data.sessionToken;
     syncNotificationStream();

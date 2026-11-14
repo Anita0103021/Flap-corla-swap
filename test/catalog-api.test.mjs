@@ -38,15 +38,13 @@ test('token board pages and status stay read-only, isolated and cached', async t
       resolves++;
       return addresses.find(row => row.token === address || row.mint === address) ?? null;
     },
-    readDashboardProjects: async (_provider, targets, blockTag, { allowTokenQuote } = {}) => {
+    readDashboardProjects: async (_provider, targets, blockTag) => {
       statusReads++;
       assert.equal(blockTag, 'latest');
       return new Map(targets.map(target => [target.mint.toLowerCase(), {
         blockNumber: 9000,
-        ...(target.mint === addresses[1].mint && !allowTokenQuote ? { error: '仅支持使用 BNB 支付的 Corla Mint' } : {
-          quoteToken: target.mint === addresses[0].mint ? ZeroAddress : quote,
-          pricePerLot: 100000000000000000n, mintedLots: 12n, totalLots: 50n, launched: false,
-        }),
+        quoteToken: target.mint === addresses[0].mint ? ZeroAddress : quote,
+        pricePerLot: 100000000000000000n, mintedLots: 12n, totalLots: 50n, launched: false,
       }]));
     },
     readCatalogQuoteMetadata: async (_provider, tokens, at) => {
@@ -93,8 +91,11 @@ test('token board pages and status stay read-only, isolated and cached', async t
   const active = await get('/api/state');
   assert.deepEqual(active.projects, []);
   assert.equal(active.running, false);
-  const strict = await (await post('/api/status', { workspace: 'mint', summaryOnly: true })).json();
-  assert.match(strict.projects.find(row => row.mint === addresses[1].mint)?.error, /仅支持使用 BNB/);
+  const mintView = await (await post('/api/status', { workspace: 'mint', summaryOnly: true })).json();
+  const tokenMint = mintView.projects.find(row => row.mint === addresses[1].mint);
+  assert.equal(tokenMint.error, undefined);
+  assert.equal(tokenMint.quoteSymbol, 'QUOTE');
+  assert.equal(tokenMint.quoteDecimals, 6);
   const time = Date.now() + 1500;
   t.mock.method(Date, 'now', () => time);
   assert.equal((await post('/api/catalog', { limit: 1 })).status, 200);

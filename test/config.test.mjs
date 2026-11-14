@@ -16,8 +16,10 @@ test('only supported Corla URL, pinned factory and exact catalog v4', () => {
 test('budget includes maximum principal and gas for every eligible action', async () => {
   const cfg = await loadConfig('config.example.json');
   assert.equal(cfg.targets.length, 2);
+  assert.equal(cfg.snipe.requirePreopen, true);
+  assert.equal(cfg.snipe.repeatAttempts, 2);
   const wallets = [{}, {}];
-  assert.equal(checkBudget(cfg, wallets), parseEther('0.2275'));
-  assert.throws(() => checkBudget({ ...cfg, maxTotalWei: parseEther('0.227499') }, wallets));
+  assert.equal(checkBudget(cfg, wallets), parseEther('0.24'));
+  assert.throws(() => checkBudget({ ...cfg, maxTotalWei: parseEther('0.239999') }, wallets));
   assert.throws(() => checkBudget(cfg, []));
 });

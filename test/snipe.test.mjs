@@ -32,8 +32,9 @@ function fixture(t, overrides = {}) {
     overrides.onPreflight?.(job);
     await job.beforeSign();
     sends++;
-    job.onBroadcast('send', { txHash, walletChecksMs: 17, preflightMs: 29, preflightOverlapped: true, signMs: 1 });
-    job.onBroadcast('ack', { txHash });
+    job.onBroadcast('send', { txHash, walletChecksMs: 17, preflightMs: 29, preflightOverlapped: true, signMs: 1,
+      broadcastConcurrency: 3 });
+    job.onBroadcast('ack', { txHash, broadcastRpcCount: 2 });
     return overrides.afterSend?.(job) ?? { status: 'confirmed', actionId: job.actionId, txHash };
   };
   execute.reconcile = overrides.reconcile;
@@ -147,6 +148,8 @@ test('verified receipt and pinned market reads overlap, then simulation overlaps
   await action;
   assert.equal(f.sends(), 1);
   assert.deepEqual(f.logs.map(row => row.event), ['snipe_detected', 'snipe_send', 'snipe_ack', 'buy']);
+  assert.equal(f.logs[1].broadcastConcurrency, 3);
+  assert.equal(f.logs[2].broadcastRpcCount, 2);
   assert.ok(f.logs[2].elapsedMs >= f.logs[2].quoteMs);
   await f.candidate({ ...candidate, source: 'http' });
   assert.equal(f.sends(), 1);

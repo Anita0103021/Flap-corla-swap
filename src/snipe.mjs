@@ -1,13 +1,15 @@
 import { setTimeout as sleep } from 'node:timers/promises';
-import { toQuantity } from 'ethers';
-import { createCorlaInspectionScope, inspectMint, verifySnipeState } from './corla.mjs';
+import { toQuantity, ZeroAddress } from 'ethers';
+import { createCorlaInspectionScope, inspectMint, isCorlaFundingClosed, requireCorlaPool, verifySnipeState } from './corla.mjs';
 import { isRpcLimit, verifyLaunchCandidate } from './events.mjs';
 import { makeLaunchFeed } from './launch-feed.mjs';
-import { applyOpeningPriceGuard, buildBuy, readMarket, readOpeningBuyTax, verifyRoundTrip } from './market.mjs';
+import { applyOpeningPriceGuard, buildBuy, readMarket, readOpeningBuyTax, ROUTER, verifyRoundTrip } from './market.mjs';
 import { readSnipeMarket, warmSnipeMarket } from './snipe-market.mjs';
 import { makeSnipeRace } from './snipe-race.mjs';
 import { actionId, BuySnapshotGuardError, LEGACY_RECEIPT_WATCH_MS, launchSearchBounds, makeJournalHistoryPoller, shortError, verifyBuySnapshot } from './monitor.mjs';
 import { rpcPoolPlan } from './rpc-config.mjs';
+import { snipeSettingsForTarget } from './config.mjs';
+import { quoteAsset, readQuoteDecimals, requireQuoteFunds } from './quote-assets.mjs';
 
 const lower = address => address?.toLowerCase();
 const ms = since => Math.round(performance.now() - since);
@@ -81,11 +83,19 @@ export async function prepareSnipe({ provider, watchProvider = provider, cfg, wa
       const state = await svc.inspectMint(provider, target, head.number, scope);
       if (signal.aborted) return null;
       log('project', { ...state, block: head.number, mint: target.mint, token: target.token, deployedToken: state.token });
-      if (state.launched || state.emergencyWithdrawn) return null;
-      if (state.phase === 1 && typeof state.pricePerLot === 'bigint' && state.pricePerLot > 0n) {
-        pendingTargets.push({ ...target, pricePerLot: state.pricePerLot });
+      if (isCorlaFundingClosed(state) ||
+          (Number.isSafeInteger(head.timestamp) && state.fundingDeadline <= BigInt(head.timestamp))) return null;
+      requireCorlaPool(state);
+      const quoteToken = quoteAsset(state.quoteToken);
+      const quote = target.snipeQuote;
+      if (quoteToken !== quoteAsset(quote?.quoteToken) || (quote && quote.quoteDecimals !== state.quoteDecimals)) {
+        throw new Error('狙击支付币或精度与已确认配置不同，请重新配置项目');
       }
-      return target;
+      const armed = quote ? { ...target, quoteToken, deploymentKey: state.deploymentKey } : target;
+      if (state.phase === 1 && typeof state.pricePerLot === 'bigint' && state.pricePerLot > 0n) {
+        pendingTargets.push({ ...armed, pricePerLot: state.pricePerLot });
+      }
+      return armed;
     } catch (e) {
       if (signal.aborted) return null;
       log('project_error', { mint: target.mint, error: shortError(e) });
@@ -218,6 +228,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
     return wallets;
   }
   async function place(candidate, target, seen, key, quoteTelemetry) {
+    const trade = snipeSettingsForTarget(settings, target);
     const settingsBlock = prepared.armBlock;
     const wallets = settings.requirePreopen ? new Map() : prepareWallets();
     let head, proof, market;
@@ -235,8 +246,8 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
         const [r, m, s, tax] = await Promise.all([
           evidence,
           settings.requirePreopen ? null : measure(times, 'marketMs', () => combinedMarket
-            ? combinedMarket(provider, target, candidate.pool, settings, head)
-            : svc.readMarket(provider, target, { launched: true, pool: candidate.pool }, settings, head)),
+            ? combinedMarket(provider, target, candidate.pool, trade, head)
+            : svc.readMarket(provider, target, { launched: true, pool: candidate.pool }, trade, head)),
           settings.requirePreopen || combinedMarket ? null :
             measure(times, 'stateMs', () => svc.verifySnipeState(provider, target, candidate.pool, head.number)),
           settings.requirePreopen ? null : measure(times, 'openingTaxMs', () =>
@@ -259,7 +270,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
             return;
           }
           if (s) read(s);
-          market = applyOpeningPriceGuard(read(m), verified.openingReserves, read(tax), settings);
+          market = applyOpeningPriceGuard(read(m), verified.openingReserves, read(tax), trade);
           proof = verified;
           break;
         }
@@ -273,6 +284,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
       pair: market.pair, amountOutMin: market.amountOutMin, quoted: market.quoted,
       openingNetOut: market.openingNetOut, quotedNetOut: market.quotedNetOut,
       openingAmountOutMin: market.openingAmountOutMin, maxOpeningPremiumBps: market.maxOpeningPremiumBps,
+      ...(trade.quoteToken ? { quoteToken: trade.quoteToken, amountIn: trade.amountIn } : {}),
       signalSource: candidate.source, marketReadMode: market.readMode, ...quoteTelemetry };
     await Promise.all(prepared.wallets.map(async wallet => {
       if (ended() || (race.enabled && race.isOwned(target, wallet))) return;
@@ -289,30 +301,35 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
         if (previous) return noteResult(previous, wallet, target, orderDetails());
         if (ended() || removed.has(inclusion(candidate))) return;
         if (awaiting.has(wallet.address)) return walletBusy();
-        const tx = svc.buildBuy(market, wallet.address, settings, head);
+        const tx = svc.buildBuy(market, wallet.address, trade, head);
         // The same exact buy is simulated while executor obtains nonce/gas
         // and estimates. The pre-sign guard awaits BOTH the simulation and
         // canonical-block checks; no trade-off between safety and latency.
         const simulation = measure(orderTimes, 'simulationMs', () =>
-          svc.verifyRoundTrip(provider, market, wallet.address, settings, head, { buyTx: tx }));
-        const request = { actionId: id, wallet, tx, singleSubmission: true,
+          svc.verifyRoundTrip(provider, market, wallet.address, trade, head, { buyTx: tx }));
+        const request = { actionId: id, wallet, tx, singleSubmission: true, quoteToken: trade.quoteToken,
           ...(warm ? { preparedWallet: warm.result } : {}),
           beforeSign: async () => {
-            const [simulationResult, snapshot] = await Promise.all([
+            const [simulationResult, snapshot, decimals] = await Promise.all([
               simulation, measure(orderTimes, 'snapshotMs', () =>
                 verifyBuySnapshot(provider, { launch: proof, quoteBlock: head, settings, armBlock: settingsBlock, signal })),
+              trade.quoteToken && trade.quoteToken !== ZeroAddress ? readQuoteDecimals(provider, trade.quoteToken, 'latest') : null,
+              trade.quoteToken && trade.quoteToken !== ZeroAddress ?
+                requireQuoteFunds(provider, trade.quoteToken, wallet.address, ROUTER, trade.amountIn, 'latest') : null,
             ]);
             signal.throwIfAborted();
             if (removed.has(inclusion(candidate))) throw new Error('开盘事件已被链重组移除');
             read(snapshot);
+            if (decimals !== null && decimals !== trade.quoteDecimals) throw new Error('买入支付币精度已变化；未发送');
             const simulated = read(simulationResult);
             if (simulated.to !== tx.to || simulated.data !== tx.data || simulated.value !== tx.value) {
               throw new Error('交易与买卖模拟不一致');
             }
           },
-          onBroadcast: (stage, { txHash, walletChecksMs, preflightMs, preflightOverlapped, signMs }) => {
+          onBroadcast: (stage, { txHash, walletChecksMs, preflightMs, preflightOverlapped, signMs,
+            broadcastConcurrency, broadcastRpcCount }) => {
             if (stage === 'send') attemptedHash = txHash;
-            for (const [name, value] of Object.entries({ walletChecksMs, preflightMs, signMs })) {
+            for (const [name, value] of Object.entries({ walletChecksMs, preflightMs, signMs, broadcastConcurrency, broadcastRpcCount })) {
               if (Number.isFinite(value) && value >= 0) orderTimes[name] = value;
             }
             if (typeof preflightOverlapped === 'boolean') orderTimes.preflightOverlapped = preflightOverlapped;
@@ -338,7 +355,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
       } catch (e) {
         if (signal.aborted && e === signal.reason) return;
         // The executor releases a staged reservation only with positive
-        // evidence of non-submission. Never resend a timed-out/ambiguous buy.
+        // evidence of non-submission. Never sign a replacement for an ambiguous buy.
         if (attemptedHash && e?.code !== 'TRANSACTION_NOT_SUBMITTED') {
           noteResult({ status: 'pending', actionId: id, wallet: wallet.address, txHash: attemptedHash,
             reason: '广播状态未知，等待回执，不重新发送' }, wallet, target, orderDetails());
@@ -357,7 +374,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
     const seen = performance.now();
     const quoteTelemetry = {};
     log('snipe_detected', { mint: target.mint, token: target.token, signalSource: candidate.source,
-      launchBlock: candidate.blockNumber, launchTx: candidate.txHash, pool: candidate.pool });
+      launchBlock: candidate.blockNumber, launchTx: candidate.txHash, pool: candidate.pool, quoteToken: target.quoteToken });
     const task = place(candidate, target, seen, key, quoteTelemetry).catch(e => {
       if (ended()) return;
       if (!attempted.has(key) && retryableProof(e)) {

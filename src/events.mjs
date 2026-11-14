@@ -1,8 +1,10 @@
 import { AbiCoder, Interface, ZeroAddress, getAddress, id, zeroPadValue } from 'ethers';
 import { FACTORY, int } from './config.mjs';
 import { PANCAKE_FACTORY, WBNB } from './market.mjs';
+import { DIRECT_LAUNCH_PORTAL } from './pool-launch.mjs';
+import { quoteAsset } from './quote-assets.mjs';
 
-export const DIRECT_LAUNCH_PORTAL = getAddress('0x000042108465206185a077edc3f3fd2b49060000');
+export { DIRECT_LAUNCH_PORTAL };
 // Observed at Corla v4 launch tx 0x59b184bd... and factory creation tx 0x26f1b611....
 export const CORLA_LAUNCH_TOPIC = '0x33a8c95f5f2db419267a319b5eae65e50fdbec72a10c6e0bc380268275dee1e4';
 export const CORLA_CREATED_TOPIC = '0x3c32f24b29de91aa01e490e681071d2eb04a2efe649d0a47425f5f518126b3be';
@@ -65,15 +67,15 @@ function validLog(log, contract, topic, from, to) {
     log.blockNumber >= from && log.blockNumber <= to;
 }
 
-function portalMatches(log, token, pool) {
-  if (!same(log?.address, DIRECT_LAUNCH_PORTAL)) return false;
+export function portalLaunchQuote(log, token, pool) {
+  if (!same(log?.address, DIRECT_LAUNCH_PORTAL)) return null;
   try {
     const decoded = PORTAL.parseLog(log);
-    if (!decoded || !same(decoded.args.token, token) || decoded.args.kind !== 0n || !same(decoded.args.schemaId, V2_SCHEMA)) return false;
+    if (!decoded || !same(decoded.args.token, token) || decoded.args.kind !== 0n || !same(decoded.args.schemaId, V2_SCHEMA)) return null;
     const [data] = ABI.decode([V2_DATA], decoded.args.data);
     return data.migratorType === 1n && data.tokenVersion === 0n && same(data.pool, pool) &&
-      data.quoteToken === ZeroAddress && data.totalSupply > 0n;
-  } catch { return false; }
+      data.totalSupply > 0n ? data.quoteToken : null;
+  } catch { return null; }
 }
 
 function seededPair(log, pool) {
@@ -107,7 +109,9 @@ function receiptLogIndex(log) {
 // by the Portal's seed Mint, and the subsequent matching launch attestations
 // establish a price reference. End-of-block reserves may already include buys.
 function initialLiquidity(receipt, target, pool, launchTopics) {
-  if (same(target.token, WBNB) || receipt.logs.length > 1024) return null;
+  const quoteToken = quoteAsset(target.quoteToken);
+  const asset = quoteToken === ZeroAddress ? WBNB : quoteToken;
+  if (same(target.token, asset) || receipt.logs.length > 1024) return null;
   function unique(contract, topic) {
     let result;
     for (const [i, log] of receipt.logs.entries()) {
@@ -127,7 +131,7 @@ function initialLiquidity(receipt, target, pool, launchTopics) {
   const launch = unique(target.mint, CORLA_LAUNCH_TOPIC);
   if (!created || !sync || !mint || !portal || !launch ||
       !(created.i < sync.i && sync.i + 1 === mint.i && mint.i < portal.i && portal.i < launch.i) ||
-      !portalMatches(portal.log, target.token, pool) || launch.log.data !== '0x' ||
+      !same(portalLaunchQuote(portal.log, target.token, pool), quoteToken) || launch.log.data !== '0x' ||
       launch.log.topics.length !== launchTopics.length ||
       !launch.log.topics.every((topic, i) => same(topic, launchTopics[i]))) return null;
 
@@ -138,14 +142,15 @@ function initialLiquidity(receipt, target, pool, launchTopics) {
   const pair = exactEvent(V2_FACTORY, 'PairCreated', created.log);
   const reserves = exactEvent(PAIR, 'Sync', sync.log);
   const funding = exactEvent(PAIR, 'Mint', mint.log);
-  const wbnbFirst = WBNB.toLowerCase() < target.token.toLowerCase();
+  const quoteFirst = asset.toLowerCase() < target.token.toLowerCase();
   if (!pair || !reserves || !funding || !same(pair.pair, pool) || pair.pairCount <= 0n ||
-      !same(pair.token0, wbnbFirst ? WBNB : target.token) || !same(pair.token1, wbnbFirst ? target.token : WBNB) ||
+      !same(pair.token0, quoteFirst ? asset : target.token) || !same(pair.token1, quoteFirst ? target.token : asset) ||
       !same(funding.sender, DIRECT_LAUNCH_PORTAL) || reserves.reserve0 <= 0n || reserves.reserve1 <= 0n ||
       funding.amount0 !== reserves.reserve0 || funding.amount1 !== reserves.reserve1) return null;
 
-  return { reserveBnb: wbnbFirst ? reserves.reserve0 : reserves.reserve1,
-    reserveToken: wbnbFirst ? reserves.reserve1 : reserves.reserve0 };
+  const reserveQuote = quoteFirst ? reserves.reserve0 : reserves.reserve1;
+  return { ...(quoteToken === ZeroAddress ? { reserveBnb: reserveQuote } : { reserveQuote }),
+    reserveToken: quoteFirst ? reserves.reserve1 : reserves.reserve0 };
 }
 
 /** An address/topic filter usable for both eth_getLogs and eth_subscribe. */
@@ -206,7 +211,7 @@ export async function readLaunchCandidates(provider, targets, fromBlock, toBlock
 }
 
 /** Bind a WebSocket or HTTP observation to the same successful receipt as
- * the official Portal V2/native launch and positive V2 LP seed.
+ * the official Portal V2 launch, expected payment asset, and positive V2 LP seed.
  */
 export async function verifyLaunchCandidate(provider, candidate) {
   if (!candidate || candidate.removed || !same(candidate.target?.factory, FACTORY) ||
@@ -214,6 +219,7 @@ export async function verifyLaunchCandidate(provider, candidate) {
       !Number.isSafeInteger(candidate.blockNumber) || candidate.blockNumber < 0 ||
       !hash(candidate.blockHash) || !hash(candidate.txHash)) return null;
   const { target, token, pool, caller, blockNumber, blockHash, txHash } = candidate;
+  const quoteToken = quoteAsset(target.quoteToken);
   let topics;
   try {
     topics = [CORLA_LAUNCH_TOPIC, ...[token, pool, caller].map(addr => zeroPadValue(getAddress(addr), 32))];
@@ -227,13 +233,14 @@ export async function verifyLaunchCandidate(provider, candidate) {
   // could become stale before the canonical head check at signing time.
   if (!receipt.logs.some(l => !l?.removed && same(l?.address, target.mint) && l.data === '0x' &&
       l.topics?.length === topics.length && l.topics.every((topic, i) => same(topic, topics[i]))) ||
-      !receipt.logs.some(l => portalMatches(l, token, pool)) ||
+      !receipt.logs.some(l => same(portalLaunchQuote(l, token, pool), quoteToken)) ||
       !receipt.logs.some(l => seededPair(l, pool))) return null;
   const openingReserves = initialLiquidity(receipt, target, pool, topics);
   // An untrusted event must not smuggle in a price reference if the receipt
   // lacks the stronger initial-liquidity evidence.
   const { openingReserves: _untrusted, ...observation } = candidate;
   return { ...observation, pool: getAddress(pool), caller: getAddress(caller),
+    ...(quoteToken === ZeroAddress ? {} : { quoteToken }),
     ...(openingReserves ? { openingReserves } : {}) };
 }
 
@@ -253,8 +260,9 @@ export async function findLaunch(provider, target, state, fromBlock, toBlock) {
   if (candidates.length !== 1) return null;
   const launch = await verifyLaunchCandidate(provider, candidates[0]);
   if (!launch) return null;
-  const { token, mint, caller, blockNumber, blockHash, txHash, openingReserves } = launch;
+  const { token, mint, caller, blockNumber, blockHash, txHash, openingReserves, quoteToken } = launch;
   return { token, mint, pool, caller, blockNumber, blockHash, txHash,
+    ...(quoteToken ? { quoteToken } : {}),
     ...(openingReserves ? { openingReserves } : {}) };
 }
 

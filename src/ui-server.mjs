@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { formatEther, ZeroAddress } from 'ethers';
-import { CHAIN_ID, address, checkBudget, int, mintWalletsFor, parseMintLink, readJson, snipeTargetUrls, validateConfig } from './config.mjs';
+import { CHAIN_ID, address, checkBudget, int, mintWalletsFor, parseMintLink, readJson, snipeOpeningDefaults, snipeTargetUrl, snipeTargetUrls, validateConfig } from './config.mjs';
 import { inspectMint, inspectParticipant } from './corla.mjs';
 import { discoverProjects } from './events.mjs';
 import { makeExecutor } from './execution.mjs';
@@ -15,31 +15,38 @@ import { actionId, makeMonitor, shortError } from './monitor.mjs';
 import { createWalletVault } from './wallet-vault.mjs';
 import { createLocalWalletUnlock } from './local-wallet-unlock.mjs';
 import { makeFastSnipe, prepareSnipe, snipeWsUrl } from './snipe.mjs';
-import { createSnipeReceiptObserver, createSnipeRunRecorder } from './snipe-run-recorder.mjs';
+import { SNIPE_RACE_WINDOW_MS } from './snipe-race.mjs';
+import { MAX_SNIPE_ATTEMPTS } from './snipe-limits.mjs';
+import { createSnipeReceiptObserver, createSnipeRunRecorder, findLatestSnipeReport } from './snipe-run-recorder.mjs';
 import { readCatalogQuoteMetadata, readDashboardParticipants, readDashboardProjects, readDashboardWalletBalances } from './dashboard-chain.mjs';
 import { createProjectMetadata } from './project-metadata.mjs';
 import { findCatalogAddress, readCatalogPage } from './catalog.mjs';
 import { readCatalogFundingTimes } from './catalog-funding.mjs';
 import { createRpcPool } from './rpc-pool.mjs';
-import { rpcPoolPlan } from './rpc-config.mjs';
+import { LOW_LATENCY_RPC_TIMEOUT_MS, rpcPoolPlan } from './rpc-config.mjs';
 import { syncParentDirectory } from './local-files.mjs';
 import { requireRuntime } from './runtime.mjs';
 import { createNotificationFeed } from './notification-feed.mjs';
 import { createNotificationStream } from './notification-stream.mjs';
+import { prepareQuoteAllowances } from './quote-allowances.mjs';
+import { createFlapQuoteCatalog } from './quote-catalog.mjs';
 
 const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const privateKeys = ['rpcUrl', 'rpcBackupUrls', 'walletFile', 'journalPath'];
 const rpcLabels = { dashboard: '工作区与代币看板', metadata: '代币元数据', mint: 'Mint 与领币', watch: '开盘监控 · HTTP', snipe: '狙击买入' };
+const snipeTiming = { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS, maxAttempts: MAX_SNIPE_ATTEMPTS };
 const MAX_FUNDING_REQUEST = 18;
 const MAX_FUNDING_QUEUE = 54;
 const FUNDING_JOB_SIZE = 12;
 const MAX_REQUEST_BYTES = 128 * 1024;
 const MAX_STATE_PROJECTS = 64;
 const publicKeys = new Set(['pollMs', 'targets', 'watchWallets', 'maxGasPriceGwei', 'gasLimitCap', 'maxTotalBnb', 'snipe', 'snipeTargets']);
-const projectKeys = new Set(['url', 'mintBatches', 'maxMintPriceBnb', 'autoClaim', 'mintWallets']);
+const projectKeys = new Set(['url', 'mintBatches', 'maxMintPriceBnb', 'autoClaim', 'mintWallets',
+  'quoteToken', 'quoteDecimals', 'maxMintPriceQuote']);
+const snipeTargetKeys = new Set(['url', 'quoteToken', 'quoteDecimals', 'amountQuote', 'minLiquidityQuote']);
 const strategyKeys = new Set(['amountBnb', 'walletCount', 'minLiquidityBnb', 'slippageBps',
   'maxBuyTaxBps', 'maxSellTaxBps', 'maxPriceImpactBps', 'windowBlocks', 'deadlineSeconds', 'scanMs', 'repeatAttempts',
-  'maxOpeningPremiumBps', 'requirePreopen']);
+  'maxOpeningPremiumBps', 'requirePreopen', 'broadcastConcurrency']);
 const assets = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/index.html': ['index.html', 'text/html; charset=utf-8'],
@@ -53,7 +60,7 @@ const postRoutes = new Set(['/api/status', '/api/discover', '/api/config', '/api
   '/api/wallets/import', '/api/wallets/remove', '/api/wallets/remember-local-unlock', '/api/wallets/forget-local-unlock',
   '/api/project/preview', '/api/project/participants', '/api/project/metadata',
   '/api/project/wallet-balances',
-  '/api/catalog', '/api/catalog/status', '/api/catalog/resolve', '/api/catalog/funding-times', '/api/notifications/stream']);
+  '/api/catalog', '/api/catalog/status', '/api/catalog/resolve', '/api/catalog/funding-times', '/api/catalog/quote-assets', '/api/notifications/stream']);
 const headers = {
   'Cache-Control': 'no-store',
   'X-Content-Type-Options': 'nosniff',
@@ -103,7 +110,11 @@ function visibleConfig(input) {
   const cfg = pick(input, publicKeys);
   if (Array.isArray(cfg.targets)) cfg.targets = cfg.targets.map(target => pick(target, projectKeys) ?? {});
   cfg.snipeTargets = snipeTargetUrls(input);
-  if (cfg.snipe !== undefined) cfg.snipe = pick(cfg.snipe, strategyKeys);
+  if (Array.isArray(cfg.snipeTargets)) cfg.snipeTargets = cfg.snipeTargets.map(row => typeof row === 'string' ? row : pick(row, snipeTargetKeys) ?? {});
+  if (cfg.snipe !== undefined) {
+    cfg.snipe = pick(cfg.snipe, strategyKeys);
+    if (cfg.snipe) Object.assign(cfg.snipe, snipeOpeningDefaults(cfg.snipe));
+  }
   return cfg;
 }
 function remember(map, key, value, limit) {
@@ -115,7 +126,7 @@ const fundingKey = ({ mint, token }) => mint.toLowerCase() + '/' + token.toLower
 function savedProjectKeys(input) {
   const urls = [
     ...(Array.isArray(input.targets) ? input.targets.map(row => row?.url) : []),
-    ...[].concat(snipeTargetUrls(input) ?? []),
+    ...[].concat(snipeTargetUrls(input) ?? []).map(snipeTargetUrl),
   ];
   return new Set(urls.flatMap(url => {
     try { return [fundingKey(parseMintLink(url))]; } catch { return []; }
@@ -152,10 +163,12 @@ export async function createUiServer({
     diskConfig[key] === undefined ? [] : [[key, diskConfig[key]]]));
   const svc = { createRpcPool, inspectMint, inspectParticipant, discoverProjects, createWalletVault, createLocalWalletUnlock, makeExecutor,
     makeMonitor, makeFastSnipe, prepareSnipe, readDashboardProjects, readDashboardParticipants, readDashboardWalletBalances,
-    createProjectMetadata, readCatalogPage, findCatalogAddress, readCatalogFundingTimes, readCatalogQuoteMetadata, createNotificationFeed, ...services };
+    createProjectMetadata, readCatalogPage, findCatalogAddress, readCatalogFundingTimes, readCatalogQuoteMetadata, createNotificationFeed,
+    prepareQuoteAllowances, createFlapQuoteCatalog, ...services };
   const vault = await svc.createWalletVault(join(root, 'state', 'wallet-vault.json'));
   const localUnlock = svc.createLocalWalletUnlock(join(root, 'state', 'wallet-unlock.dpapi'));
   const metadata = svc.createProjectMetadata();
+  const readFlapQuoteCatalog = svc.createFlapQuoteCatalog();
   const sessionToken = randomBytes(32).toString('hex');
   const stateEpoch = randomBytes(8).toString('hex');
   let configRevision = randomBytes(16).toString('hex');
@@ -170,7 +183,7 @@ export async function createUiServer({
   let reading = false;
   let lastError;
   let lastErrorWorkspace;
-  let lastSnipeReport = null;
+  let lastSnipeReport = await findLatestSnipeReport(root).catch(() => null);
   const logs = [];
   const projects = new Map();
   let dashboardReady;
@@ -323,14 +336,16 @@ export async function createUiServer({
     if (summaryJobs.size >= 4) throw new HttpError(409, '项目刷新请求过多，请稍后再试');
     const work = (async () => {
       const provider = await dashboardProvider(cfg);
-      const read = await svc.readDashboardProjects(provider, cfg.targets, 'latest', { allowTokenQuote: cfg.workspace === 'catalog' && !remember });
-      return cfg.targets.map(target => {
+      const read = await svc.readDashboardProjects(provider, cfg.targets, 'latest');
+      const rows = cfg.targets.map(target => {
         const chain = read.get(target.mint.toLowerCase()) ?? { error: '未读到项目合约状态' };
         const block = chain.blockNumber;
         const row = { ...chain, block, mint: target.mint, token: target.token, deployedToken: chain.token };
-        if (remember) rememberProjectSnapshot(row, revision);
         return row;
       });
+      const enriched = remember ? await catalogQuotes(cfg, rows) : rows;
+      if (remember) for (const row of enriched) rememberProjectSnapshot(row, revision);
+      return enriched;
     })();
     summaryJobs.set(key, work);
     try { return await work; } finally { summaryJobs.delete(key); }
@@ -435,7 +450,7 @@ export async function createUiServer({
       if (row.error || !row.quoteToken) return row;
       if (row.quoteToken === ZeroAddress) return { ...row, nativeQuote: true, quoteSymbol: 'BNB', quoteDecimals: 18 };
       const meta = catalogQuoteCache.get(row.quoteToken.toLowerCase());
-      return { ...row, nativeQuote: false, quoteSymbol: meta?.quoteSymbol ?? null, quoteDecimals: meta?.quoteDecimals ?? null };
+      return { ...row, nativeQuote: false, quoteSymbol: meta?.quoteSymbol ?? null, quoteDecimals: row.quoteDecimals ?? meta?.quoteDecimals ?? null };
     });
   }
   async function catalogStatus(urls) {
@@ -594,8 +609,10 @@ export async function createUiServer({
     if (cached && Date.now() - cached.time < 2000) return cached.result;
     if (walletBalanceJobs.size >= 4) throw new HttpError(409, '钱包余额查询过多，请稍后再试');
     const work = (async () => {
-      const provider = await dashboardProvider(checked(undefined, 'mint'));
+      const cfg = checked(undefined, 'mint');
+      const provider = await dashboardProvider(cfg);
       const result = await svc.readDashboardWalletBalances(provider, target, wallets);
+      if (result.project) [result.project] = await catalogQuotes(cfg, [result.project]);
       remember(walletBalanceCache, key, { time: Date.now(), result }, 24);
       return result;
     })();
@@ -641,8 +658,9 @@ export async function createUiServer({
           return { block: block.number, mint: target.mint, token: target.token, error: shortError(error) };
         }
       }));
-      for (const row of results) rememberProjectSnapshot(row, revision);
-      return results;
+      const rows = await catalogQuotes(cfg, results);
+      for (const row of rows) rememberProjectSnapshot(row, revision);
+      return rows;
     } finally { releaseProvider(provider); }
   }
   async function discover(blocks) {
@@ -666,8 +684,9 @@ export async function createUiServer({
       try {
         const block = await provider.getBlock('latest');
         if (!block) throw new Error('无法读取 BSC 区块');
-        const chain = await svc.inspectMint(provider, target, block.number);
-        return { block: block.number, ...chain, mint: target.mint, token: target.token, deployedToken: chain.token };
+        const chain = await svc.inspectMint(provider, target, block.number, undefined, { verifyPool: true });
+        const [row] = await catalogQuotes(cfg, [{ block: block.number, ...chain, mint: target.mint, token: target.token, deployedToken: chain.token }]);
+        return row;
       } finally { releaseProvider(provider); }
     })();
     previewJobs.set(key, work);
@@ -798,7 +817,7 @@ export async function createUiServer({
     }
     const budget = live ? checkBudget(cfg, expectedWallets) : null;
     const task = { mode, workspace, controller: new AbortController(), ready: false, done: null };
-    let recorder, receiptObserver;
+    let recorder, receiptObserver, startupError;
     const jobLog = (event, fields) => {
       log(event, { ...fields, workspace });
       recorder?.record(event, fields);
@@ -813,6 +832,15 @@ export async function createUiServer({
       let provider, watchProvider, executor;
       try {
         const fastSnipe = live && workspace === 'snipe';
+        if (fastSnipe) {
+          // Create the file as soon as the launch request is accepted.
+          // Diagnostics from RPC checks, arming and allowances belong to
+          // the same run even if the monitor never starts.
+          recorder = await createSnipeRunRecorder({ rootDir: root, settings: cfg.snipe, targets: cfg.targets });
+          lastSnipeReport = recorder.reportPath;
+          stateChanged();
+          signal.throwIfAborted();
+        }
         // WSS remains a separate fast path; the HTTP watcher rotates
         // independently and still covers disconnects or missing events.
         const wsUrl = fastSnipe ? snipeWsUrl(rpcPoolPlan(cfg, 'watch').urls[0]) : undefined;
@@ -840,8 +868,16 @@ export async function createUiServer({
           prepared = { ...await svc.prepareSnipe({ provider, watchProvider, cfg, wallets, signal, log: jobLog }), wsUrl };
         }
         executor = await svc.makeExecutor({ provider, wallets, live, signal, maxGasPriceWei: cfg.maxGasPriceWei,
-          gasLimitCap: cfg.gasLimitCap, journalPath: cfg.journalPath, confirmations: 3, receiptTimeoutMs: prepared ? 0 : 1500,
-          directBroadcast: Boolean(prepared) });
+          gasLimitCap: cfg.gasLimitCap, journalPath: cfg.journalPath, confirmations: 3, receiptTimeoutMs: fastSnipe ? 0 : 1500,
+          directBroadcast: fastSnipe, ...(fastSnipe ? { broadcastConcurrency: cfg.snipe.broadcastConcurrency } : {}) });
+        const approvals = live ? await svc.prepareQuoteAllowances({
+          provider, cfg, wallets, execute: executor, signal, log: jobLog, inspect: svc.inspectMint,
+        }) : 0;
+        // An approval wait can span the entire opening window. Never use an
+        // arming cutoff from before the wallets were ready for this market.
+        if (fastSnipe && approvals) {
+          prepared = { ...await svc.prepareSnipe({ provider, watchProvider, cfg, wallets, signal, log: jobLog }), wsUrl };
+        }
         const armBlock = prepared?.armBlock ?? await provider.getBlockNumber();
         signal.throwIfAborted();
         const execute = async request => {
@@ -859,11 +895,8 @@ export async function createUiServer({
         execute.reconcilePending = executor.reconcilePending;
         execute.reconcileRecent = executor.reconcileRecent;
         if (prepared) {
-          recorder = await createSnipeRunRecorder({ rootDir: root, settings: cfg.snipe,
-            targets: prepared.targets, armBlock: prepared.armBlock });
           receiptObserver = createSnipeReceiptObserver({ provider: watchProvider, record: recorder.record, signal });
           signal.throwIfAborted();
-          lastSnipeReport = recorder.reportPath;
         }
         const fast = prepared ? svc.makeFastSnipe({ provider, watchProvider, settings: cfg.snipe, prepared, cfg, execute, signal, log: jobLog }) : null;
         const tick = fast ? null : svc.makeMonitor({ provider, cfg, wallets, execute, armBlock, signal, log: jobLog });
@@ -922,17 +955,26 @@ export async function createUiServer({
         }
       } catch (e) {
         const error = signal.aborted ? '任务已停止' : shortError(e);
-        if (!task.ready) rejectReady(new HttpError(400, error));
+        if (!task.ready) startupError = new HttpError(400, error);
         if (!signal.aborted) jobLog('watch_error', { error });
       } finally {
         password = undefined;
         try { executor?.close?.(); } catch { jobLog('watch_error', { error: '交易日志未能正常关闭' }); }
-        if (task.ready) jobLog('watch_stopped');
+        if (task.ready || (recorder && signal.aborted)) jobLog('watch_stopped');
         try { await receiptObserver?.close(); } catch { /* Telemetry must not prevent shutdown. */ }
-        try { await recorder?.close(); } catch { log('watch_error', { workspace, error: '测速记录未能正常结束，请查看已写入的部分' }); }
-        if (watchProvider !== provider) releaseProvider(watchProvider);
-        releaseProvider(provider);
-        if (run === task) { run = null; stateChanged(); }
+        try {
+          const report = await recorder?.close();
+          if (report?.failed) throw new Error('Report write failed');
+          if (report?.dropped) log('snipe_report_warning', { workspace,
+            message: '运行记录有 ' + report.dropped + ' 条事件未写入，请核对文件末行统计。' });
+        } catch { log('watch_error', { workspace, error: '测速记录未能正常结束，请查看已写入的部分' }); }
+        try {
+          if (watchProvider !== provider) releaseProvider(watchProvider);
+          releaseProvider(provider);
+        } finally {
+          if (run === task) { run = null; stateChanged(); }
+          if (startupError) rejectReady(startupError);
+        }
       }
     })();
     await started;
@@ -967,7 +1009,7 @@ export async function createUiServer({
       }
       if (req.method === 'GET' && pathname === '/api/bootstrap') {
         const wallets = await walletSummary();
-        return json(res, 200, { config: visibleConfig(diskConfig), configRevision, source, sessionToken, allowLive, ...wallets });
+        return json(res, 200, { config: visibleConfig(diskConfig), configRevision, source, sessionToken, allowLive, snipeTiming, ...wallets });
       }
       if (req.method === 'GET' && pathname === '/api/state') {
         const since = requestUrl.searchParams.get('since');
@@ -1018,6 +1060,15 @@ export async function createUiServer({
       if (pathname === '/api/catalog/status') result = { projects: await catalogStatus(body.urls) };
       if (pathname === '/api/catalog/resolve') result = { project: await resolveCatalogAddress(body.address) };
       if (pathname === '/api/catalog/funding-times') result = catalogFundingTimes(body.urls);
+      if (pathname === '/api/catalog/quote-assets') {
+        if (Object.keys(body).length) throw new HttpError(400, '底池目录无需附加参数');
+        try {
+          result = await readFlapQuoteCatalog(await dashboardProvider(checked(undefined, 'mint')));
+        } catch {
+          // A failed read on an existing route is not a missing API route.
+          throw new HttpError(503, '底池目录暂时读取失败，请稍后重试', 'QUOTE_CATALOG_UNAVAILABLE');
+        }
+      }
       if (pathname === '/api/status' && body.summaryOnly === true) {
         const startedAt = performance.now();
         const cfg = checked(body.config, body.workspace ?? 'all');

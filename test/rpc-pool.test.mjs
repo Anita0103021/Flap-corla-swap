@@ -254,6 +254,117 @@ test('one-shot raw submission never uses a standby after the first POST, includi
   }
 });
 
+test('one broadcast round fans out identical raw bytes and returns the first matching ack', { timeout: 3000 }, async t => {
+  const hash = keccak256(tx);
+  const bothStarted = Promise.withResolvers();
+  const releaseSlow = Promise.withResolvers();
+  let started = 0;
+  const raw = async (p, response) => {
+    if (p.method !== 'eth_sendRawTransaction') return;
+    if (++started === 2) bothStarted.resolve();
+    await bothStarted.promise;
+    return response();
+  };
+  const { provider, op } = fixture(t, {
+    [fast]: p => raw(p, () => releaseSlow.promise),
+    [backup]: async p => {
+      if (p.id >= 2_000_000_000 && p.method === 'eth_blockNumber') await wait(25);
+      return raw(p, () => hash);
+    },
+    [third]: async p => {
+      if (p.id >= 2_000_000_000 && p.method === 'eth_blockNumber') await wait(150);
+      if (p.method === 'eth_sendRawTransaction') assert.fail('outside the configured wave');
+    },
+  });
+  const dispatches = [];
+  try {
+    assert.equal(await provider.submitRawTransaction(tx, { singleSubmission: true, broadcastConcurrency: 2,
+      onDispatch: count => dispatches.push(count) }), hash);
+    assert.deepEqual(dispatches, [2]);
+    const posts = op('eth_sendRawTransaction');
+    assert.equal(posts.length, 2);
+    assert.deepEqual(posts.map(p => p.key).sort(), [fast, backup].sort());
+    for (const p of posts) {
+      assert.deepEqual(p.params, [tx]);
+      assert.equal(p.batch, false);
+      assert.ok(Number(p.headers['content-length']) > 0);
+    }
+  } finally { releaseSlow.resolve(limited(1)); }
+});
+
+test('parallel submit filters wrong-chain and unavailable endpoints and does not repeat eligible ones', async t => {
+  const hash = keccak256(tx);
+  const { provider, op } = fixture(t, {
+    [fast]: p => p.method === 'eth_sendRawTransaction' ? hash : undefined,
+    [backup]: p => p.method === 'eth_chainId' ? '0x1' : undefined,
+    [third]: p => p.method === 'eth_simulateV1' ? fail('method not supported', -32601) : undefined,
+  }, { requiredMethods: ['eth_simulateV1'] });
+  const dispatches = [];
+  assert.equal(await provider.submitRawTransaction(tx, { singleSubmission: true, broadcastConcurrency: 8,
+    onDispatch: count => dispatches.push(count) }), hash);
+  assert.deepEqual(dispatches, [1]);
+  assert.deepEqual(op('eth_sendRawTransaction').map(p => p.key), [fast]);
+  for (const bad of [0, 2.5, 9, '2', null]) {
+    await assert.rejects(provider.submitRawTransaction(tx, { singleSubmission: true, broadcastConcurrency: bad }), /concurrency/);
+  }
+  await assert.rejects(provider.submitRawTransaction(tx, { broadcastConcurrency: 2 }), /concurrency/);
+  assert.equal(op('eth_sendRawTransaction').length, 1);
+});
+
+test('parallel submit is definitely rejected only when every started POST explicitly rejects', async t => {
+  const hash = keccak256(tx);
+  for (const [response, definite] of [
+    [() => limited(3), true],
+    [() => new Response('', { status: 504 }), false],
+    [() => fail('nonce too low (' + tx + ')'), false],
+    [() => '0x' + '99'.repeat(32), false],
+  ]) {
+    const { provider, op } = fixture(t, {
+      [fast]: p => p.method === 'eth_sendRawTransaction' ? limited(1) : undefined,
+      [backup]: p => p.method === 'eth_sendRawTransaction' ? response() : undefined,
+    });
+    await assert.rejects(provider.submitRawTransaction(tx, { singleSubmission: true, broadcastConcurrency: 2 }),
+      error => isDefinitelyNotSubmitted(error, hash) === definite && !error.message.includes(tx));
+    assert.equal(op('eth_sendRawTransaction').length, 2);
+  }
+});
+
+test('parallel submit skips all POSTs when stopped before dispatch', async t => {
+  const stop = new AbortController();
+  const { provider, op } = fixture(t, { [fast]: () => {}, [backup]: () => {} });
+  const running = provider.submitRawTransaction(tx, {
+    signal: stop.signal, singleSubmission: true, broadcastConcurrency: 2,
+  });
+  stop.abort();
+  await assert.rejects(running, e => isDefinitelyNotSubmitted(e, keccak256(tx)));
+  assert.equal(op('eth_sendRawTransaction').length, 0);
+});
+
+test('the race dispatch guard is checked after RPC readiness and closes before any POST', async t => {
+  for (const broadcastConcurrency of [1, 2]) {
+    const probeStarted = Promise.withResolvers();
+    const releaseProbe = Promise.withResolvers();
+    let closed = false;
+    const hold = async p => {
+      if (p.method === 'eth_blockNumber') {
+        probeStarted.resolve();
+        await releaseProbe.promise;
+      }
+    };
+    const { provider, op } = fixture(t, { [fast]: hold, [backup]: hold });
+    const send = provider.submitRawTransaction(tx, {
+      singleSubmission: true, broadcastConcurrency,
+      beforeDispatch() { if (closed) throw new Error('opened during readiness'); },
+      onDispatch() { assert.fail('no POST should start'); },
+    });
+    await probeStarted.promise;
+    closed = true;
+    releaseProbe.resolve();
+    await assert.rejects(send, e => isDefinitelyNotSubmitted(e, keccak256(tx)));
+    assert.equal(op('eth_sendRawTransaction').length, 0);
+  }
+});
+
 test('one-shot raw submission prevents native fetch from replaying the POST on HTTP 421', async t => {
   let posts = 0;
   const server = createServer(async (req, res) => {

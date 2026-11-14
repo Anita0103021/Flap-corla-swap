@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Interface, ZeroAddress } from 'ethers';
 import { FACTORY } from '../src/config.mjs';
 import { CORLA_ABI } from '../src/corla.mjs';
+import { QUOTE_ERC20 } from '../src/quote-assets.mjs';
 import { MULTICALL3, readCatalogQuoteMetadata, readDashboardParticipants, readDashboardProjects, readDashboardWalletBalances } from '../src/dashboard-chain.mjs';
 
 const MC = new Interface([
@@ -12,7 +13,7 @@ const MC = new Interface([
   'function getEthBalance(address) view returns (uint256)',
 ]);
 const REGISTRY = new Interface(['function deploymentIndexPlusOne(address) view returns (uint256)']);
-const QUOTE = new Interface(['function symbol() view returns (string)', 'function decimals() view returns (uint8)']);
+const QUOTE = QUOTE_ERC20;
 const addr = n => '0x' + n.toString(16).padStart(40, '0');
 const target = (n, launched = false) => ({ mint: addr(100 + n), token: addr(500 + n), factory: FACTORY, launched });
 const wallet = addr(75);
@@ -114,21 +115,23 @@ test('a failed subcall only degrades its own project', async () => {
   assert.deepEqual(p.requests, [[MULTICALL3, 250]]);
 });
 
-test('ERC-20 status is opt-in and preserves the verified launched state without enabling wallet actions', async () => {
+test('ERC-20 wallet preview pins both native and token balances and preserves claimable shares', async () => {
   const quoteToken = addr(911);
   const targets = [fixture[0], { ...fixture[1], quoteToken }];
-  const p = createProvider({ targets });
-  const rows = await readDashboardProjects(p, targets, 250, { allowTokenQuote: true });
+  const p = createProvider({ targets, quoteMetadata: { [quoteToken]: { balanceOf: 70n, allowance: 20n } } });
+  const rows = await readDashboardProjects(p, targets, 250);
   assert.equal(rows.get(targets[0].mint).quoteToken, ZeroAddress);
   assert.equal(rows.get(targets[1].mint).quoteToken.toLowerCase(), quoteToken);
   assert.equal(rows.get(targets[1].mint).launched, true);
   assert.equal(rows.get(targets[1].mint).mintedLots, 10n);
-  const strict = await readDashboardProjects(p, targets, 250);
-  assert.match(strict.get(targets[1].mint).error, /仅支持使用 BNB/);
   const balances = await readDashboardWalletBalances(p, targets[1], [wallet], 250);
-  assert.equal(balances.project, undefined);
-  assert.equal(balances.wallets[0].mintedLots, undefined);
-  assert.equal(balances.wallets[0].hasUnclaimedShare, undefined);
+  assert.equal(balances.project.quoteToken.toLowerCase(), quoteToken);
+  assert.equal(balances.wallets[0].mintedLots, 1n);
+  assert.equal(balances.wallets[0].hasUnclaimedShare, true);
+  assert.equal(balances.wallets[0].balanceWei, 101n);
+  assert.equal(balances.wallets[0].quoteBalance, 70n);
+  assert.equal(balances.wallets[0].quoteAllowance, 20n);
+  assert.ok(p.requests.every(([, at]) => at === 250));
 });
 
 test('quote metadata batches distinct addresses at a fixed block and never guesses missing precision', async () => {

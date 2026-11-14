@@ -1,4 +1,5 @@
 import { JsonRpcProvider, keccak256, toQuantity } from 'ethers';
+import { LOW_LATENCY_RPC_TIMEOUT_MS, MAX_BROADCAST_CONCURRENCY } from './rpc-config.mjs';
 
 const BSC_ID = 56n;
 const MAX_LAG = 4;
@@ -190,7 +191,7 @@ class RpcPool extends JsonRpcProvider {
     this.#now = options.now ?? Date.now;
     this.#probeInterval = options.probeIntervalMs ?? 30_000;
     this.#probeTimeout = options.probeTimeoutMs ?? 2000;
-    this.#requestTimeout = options.requestTimeoutMs ?? (options.lowLatency ? 2200 : 3500);
+    this.#requestTimeout = options.requestTimeoutMs ?? (options.lowLatency ? LOW_LATENCY_RPC_TIMEOUT_MS : 3500);
     this.#responseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     if (!Number.isSafeInteger(this.#responseBytes) || this.#responseBytes < 128 || this.#responseBytes > MAX_RESPONSE_BYTES) {
       throw new Error('Invalid RPC response size limit');
@@ -526,18 +527,82 @@ class RpcPool extends JsonRpcProvider {
     return items.map(i => results.get(i.id) ?? absentReceipts.get(i.id) ?? fallback.get(i.id) ??
       failurePacket(i.id, this.#endpoints.some(e => e.reason === 'rate-limit') ? 'rate' : 'method'));
   }
-  async submitRawTransaction(signed, { signal, singleSubmission = false } = {}) {
+  async #postRaw(ep, item, singleSubmission) {
+    const generation = ep.generation;
+    let packet;
+    try {
+      // A stopped job can still have an in-flight POST; its outcome may be unknown.
+      packet = (await this.#wire(ep, [item], this.#requestTimeout, { singleSubmission })).get(item.id);
+    } catch (error) {
+      if (error?.kind === 'rate') {
+        this.#penalize(ep, generation, 'rate-limit', error);
+        throw error; // Local HTTP 429, not an unstructured RPC error.
+      }
+      this.#penalize(ep, generation, error?.kind ?? 'offline', error);
+      throw rpcError('Raw transaction submission outcome unknown');
+    }
+    if (!packet || ep.state === 'wrong-chain') throw rpcError('Raw transaction submission outcome unknown');
+    if ('error' in packet) {
+      if (isLimit(packet.error, RAW, false)) this.#penalize(ep, generation, 'rate-limit');
+      // Don't expose upstream error text, which may contain credentials or raw data.
+      throw rpcError('Raw transaction submission outcome unknown');
+    }
+    if (typeof packet.result !== 'string' || !/^0x[0-9a-f]{64}$/i.test(packet.result)) {
+      throw rpcError('Raw transaction submission outcome unknown');
+    }
+    return packet.result;
+  }
+  async submitRawTransaction(signed, { signal, singleSubmission = false, broadcastConcurrency = 1, beforeDispatch, onDispatch } = {}) {
     if (typeof singleSubmission !== 'boolean') throw new TypeError('Invalid raw submission policy');
+    if (!Number.isSafeInteger(broadcastConcurrency) || broadcastConcurrency < 1 ||
+        broadcastConcurrency > MAX_BROADCAST_CONCURRENCY || (broadcastConcurrency > 1 && !singleSubmission)) {
+      throw new TypeError('Invalid raw broadcast concurrency');
+    }
+    if (beforeDispatch !== undefined && (!singleSubmission || typeof beforeDispatch !== 'function')) {
+      throw new TypeError('Invalid single-submission dispatch guard');
+    }
     if (typeof signed !== 'string' || !/^0x(?:[0-9a-f]{2})+$/i.test(signed) || signed.length > 512 * 1024) {
       throw notSubmitted('Invalid raw transaction; not submitted');
     }
     const refused = (message, status) => notSubmitted(message, status, keccak256(signed));
+    const stopped = () => signal?.aborted || this.#shutdown.signal.aborted;
     const mayStart = () => {
-      if (signal?.aborted || this.#shutdown.signal.aborted) throw refused('Broadcast cancelled before acceptance');
+      if (stopped()) throw refused('Broadcast cancelled before acceptance');
     };
+    const dispatched = count => { try { onDispatch?.(count); } catch { /* telemetry only */ } };
     mayStart();
     try { await this.readyRpc(); } catch { throw refused('No healthy RPC before broadcast'); }
+    mayStart();
+    // Readiness can suspend the caller. Recheck the synchronous gate before
+    // the first POST; a closed gate is positive proof no endpoint saw the raw.
+    try { beforeDispatch?.(); } catch { throw refused('Dispatch window closed before broadcast'); }
     const item = { id: 1, method: RAW, params: [signed], jsonrpc: '2.0' };
+    if (broadcastConcurrency > 1) {
+      mayStart();
+      const endpoints = this.#pick([item]).slice(0, broadcastConcurrency);
+      if (!endpoints.length) throw refused('No healthy RPC before broadcast');
+      const expected = keccak256(signed);
+      const posts = [];
+      // One bounded wave, one POST per selected RPC, all for the signed hash
+      // already in the journal. Never open new slots after this wave starts.
+      for (const ep of endpoints) {
+        if (stopped()) break;
+        posts.push(this.#postRaw(ep, item, true).then(hash => {
+          if (hash.toLowerCase() !== expected) throw rpcError('Raw transaction submission outcome unknown');
+          return hash;
+        }));
+      }
+      if (!posts.length) throw refused('Broadcast cancelled before acceptance');
+      dispatched(posts.length);
+      try { return await Promise.any(posts); }
+      catch (error) {
+        // Only release the nonce if every started POST was definitely rejected.
+        if (error.errors.every(e => e?.kind === 'rate')) {
+          throw refused('All attempted RPC nodes refused the broadcast (HTTP 429)', 429);
+        }
+        throw rpcError('Raw transaction submission outcome unknown');
+      }
+    }
     const tried = new Set();
     while (true) {
       mayStart();
@@ -545,34 +610,14 @@ class RpcPool extends JsonRpcProvider {
       if (!ep) throw refused(tried.size ? 'All attempted RPC nodes refused the broadcast (HTTP 429)' :
         'No healthy RPC before broadcast', tried.size ? 429 : undefined);
       tried.add(ep);
-      const generation = ep.generation;
-      let packet;
+      const post = this.#postRaw(ep, item, singleSubmission);
+      dispatched(tried.size);
       try {
-        // An in-flight request may already have reached the node. Do not
-        // abort it on a task stop, but never begin another attempt afterward.
-        packet = (await this.#wire(ep, [item], this.#requestTimeout, { singleSubmission })).get(item.id);
+        return await post;
       } catch (error) {
-        if (error?.kind === 'rate') {
-          this.#penalize(ep, generation, 'rate-limit', error);
-          // A one-shot buy never uses a second endpoint after the first
-          // raw POST, even when this gateway definitively refused it.
-          if (singleSubmission) throw refused('Single submission refused (HTTP 429)', 429);
-          continue; // HTTP 429, not an unstructured JSON error/message.
-        }
-        this.#penalize(ep, generation, error?.kind ?? 'offline', error);
-        throw rpcError('Raw transaction submission outcome unknown');
+        if (error?.kind !== 'rate') throw error;
+        if (singleSubmission) throw refused('Single submission refused (HTTP 429)', 429);
       }
-      if (!packet || ep.state === 'wrong-chain') throw rpcError('Raw transaction submission outcome unknown');
-      if ('error' in packet) {
-        if (isLimit(packet.error, RAW, false)) this.#penalize(ep, generation, 'rate-limit');
-        // Do not forward an upstream error string on a signed request at all.
-        // It can contain credentials or fragments of the raw payload.
-        throw rpcError('Raw transaction submission outcome unknown');
-      }
-      if (typeof packet.result !== 'string' || !/^0x[0-9a-f]{64}$/i.test(packet.result)) {
-        throw rpcError('Raw transaction submission outcome unknown');
-      }
-      return packet.result;
     }
   }
   async send(method, params) {

@@ -28,12 +28,13 @@
     "minLiquidityBnb": "1",
     "slippageBps": 1000,
     "maxOpeningPremiumBps": 1000,
-    "requirePreopen": false,
+    "requirePreopen": true,
     "maxBuyTaxBps": 500,
     "maxSellTaxBps": 500,
     "maxPriceImpactBps": 1000,
     "windowBlocks": 15,
     "deadlineSeconds": 12,
-    "repeatAttempts": 1
+    "broadcastConcurrency": 1,
+    "repeatAttempts": 2
   }
 }

@@ -8,6 +8,9 @@ import { basename, dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { getAddress } from 'ethers';
 import { parseMintLink } from '../src/config.mjs';
+import { LOW_LATENCY_RPC_TIMEOUT_MS } from '../src/rpc-config.mjs';
+import { SNIPE_RACE_WINDOW_MS } from '../src/snipe-race.mjs';
+import { MAX_SNIPE_ATTEMPTS } from '../src/snipe-limits.mjs';
 import { createUiServer } from '../src/ui-server.mjs';
 
 const prefix = 'corla-ui-test-';
@@ -169,7 +172,7 @@ async function fixture(t, { chainId = 56n, localWallets = false, localConfig, be
     'X-Corla-Session': bootstrap.sessionToken,
   };
   return {
-    rootDir, url, bootstrap, head, observed,
+    rootDir, url, bootstrap, head, observed, services,
     get(path) { return fetch(url + path, { headers }); },
     async post(path, body, extra = {}) {
       const merged = new Headers(headers);
@@ -651,19 +654,151 @@ test('UI does not arm a live task while the wallet set is being changed', async 
 test('workspace bootstrap migrates legacy buy switches without arming first-run samples', async t => {
   const fresh = await fixture(t);
   assert.deepEqual(fresh.bootstrap.config.snipeTargets, []);
+  assert.equal(fresh.bootstrap.config.snipe.requirePreopen, true);
+  assert.equal(fresh.bootstrap.config.snipe.repeatAttempts, 2);
   const old = JSON.parse(await readFile(fakeConfigFile, 'utf8'));
   delete old.snipeTargets;
+  delete old.snipe.requirePreopen;
+  old.snipe.repeatAttempts = 1;
   old.targets[0].buyOnLaunch = true;
   old.targets[1].buyOnLaunch = false;
   const legacy = await fixture(t, { localConfig: old });
   assert.equal(legacy.bootstrap.source, 'local');
   assert.deepEqual(legacy.bootstrap.config.snipeTargets, [old.targets[0].url]);
+  assert.equal(legacy.bootstrap.config.snipe.requirePreopen, false);
+  assert.equal(legacy.bootstrap.config.snipe.repeatAttempts, 1);
   assert.equal(JSON.parse(await readFile(join(legacy.rootDir, 'config.local.json'), 'utf8')).snipeTargets, undefined);
 
   const edited = { ...legacy.bootstrap.config, snipeTargets: [] };
   assert.deepEqual((await ok(await legacy.post('/api/config', { config: edited }))).config.snipeTargets, []);
   assert.deepEqual((await ok(await legacy.get('/api/bootstrap'))).config.snipeTargets, []);
   assert.equal(legacy.observed.executors.length, 0);
+});
+
+test('sniper concurrency and round settings survive saving, reload, and execution setup', async t => {
+  const f = await fixture(t, { localWallets: true });
+  const original = f.bootstrap.config;
+  const strategy = { ...original.snipe, broadcastConcurrency: 4, repeatAttempts: 12 };
+  const invalid = { ...original, snipe: { ...strategy, broadcastConcurrency: 9 } };
+  assert.equal((await f.post('/api/config', { config: invalid })).status, 400);
+  const config = { ...original, snipeTargets: [original.targets[0].url], snipe: strategy };
+  const saved = await ok(await f.post('/api/config', { config }));
+  assert.deepEqual(saved.config.snipe, strategy);
+  const disk = JSON.parse(await readFile(join(f.rootDir, 'config.local.json'), 'utf8'));
+  assert.deepEqual(disk.snipe, strategy);
+  const reopened = await ok(await f.get('/api/bootstrap'));
+  assert.deepEqual(reopened.config.snipe, strategy);
+  assert.deepEqual(reopened.snipeTiming, { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS,
+    maxAttempts: MAX_SNIPE_ATTEMPTS });
+  const run = await ok(await f.post('/api/start', liveBody(f, { config: reopened.config, workspace: 'snipe' })));
+  assert.equal(run.workspace, 'snipe');
+  assert.equal(f.observed.executors[0].broadcastConcurrency, 4);
+  assert.equal(f.observed.monitors[0].settings.repeatAttempts, 12);
+  assert.equal(f.observed.monitors[0].settings.requirePreopen, true);
+  assert.equal((await ok(await f.post('/api/stop', { workspace: 'snipe' }))).running, false);
+  const report = await readFile(join(f.rootDir, run.snipeReport), 'utf8');
+  const { settings } = JSON.parse(report.split('\n')[0]);
+  assert.equal(settings.broadcastConcurrency, 4);
+  assert.equal(settings.repeatAttempts, 12);
+  assert.equal(settings.requirePreopen, true);
+  const optedOut = { ...reopened.config, snipe: { ...strategy, requirePreopen: false, repeatAttempts: 1 } };
+  await ok(await f.post('/api/config', { config: optedOut }));
+  assert.deepEqual((await ok(await f.get('/api/bootstrap'))).config.snipe, optedOut.snipe);
+});
+
+const snipeBodyFor = f => liveBody(f, { workspace: 'snipe', config: {
+  ...f.bootstrap.config, snipeTargets: [f.bootstrap.config.targets[0].url],
+} });
+async function readRun(f, state) {
+  assert.match(state.snipeReport, /^reports\/snipe-runs\/snipe-[\w-]+\.ndjson$/);
+  return (await readFile(join(f.rootDir, state.snipeReport), 'utf8')).trim().split('\n').map(JSON.parse);
+}
+
+test('a report is opened before the first RPC check; startup failure is written before the API returns', async t => {
+  const f = await fixture(t, { chainId: 1n, localWallets: true });
+  assert.equal((await ok(await f.get('/api/state'))).snipeReport, null);
+  assert.equal((await f.post('/api/start', snipeBodyFor(f))).status, 400);
+  const state = await ok(await f.get('/api/state'));
+  const rows = await readRun(f, state);
+  assert.equal(state.running, false);
+  assert.equal(f.observed.unlocks, 0);
+  assert.equal(f.observed.executors.length, 0);
+  assert.deepEqual(rows.map(row => row.event), ['run_start', 'watch_error', 'run_end']);
+  assert.equal(rows[0].armBlock, undefined);
+  assert.equal(rows.at(-1).dropped, 0);
+  noSecret(rows, f.bootstrap.sessionToken, checkedWallet);
+});
+
+test('a report storage error stops sniper setup before RPC, wallet unlock or execution', async t => {
+  const f = await fixture(t, { localWallets: true });
+  await writeFile(join(f.rootDir, 'reports'), 'test fixture blocking directory creation');
+  const response = await f.post('/api/start', snipeBodyFor(f));
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /狙击测速记录/);
+  const state = await ok(await f.get('/api/state'));
+  assert.equal(state.running, false);
+  assert.equal(state.snipeReport, null);
+  assert.equal(f.observed.providers, 0);
+  assert.equal(f.observed.unlocks, 0);
+  assert.equal(f.observed.executors.length, 0);
+});
+
+test('canceling a sniper before arming still leaves a complete report', async t => {
+  const gate = Promise.withResolvers(), checking = Promise.withResolvers();
+  const f = await fixture(t, { localWallets: true, beforeNetwork: () => {
+    checking.resolve(); return gate.promise;
+  } });
+  const starting = f.post('/api/start', snipeBodyFor(f));
+  let stopping;
+  try {
+    await checking.promise;
+    const state = await ok(await f.get('/api/state'));
+    assert.equal(state.starting, true);
+    const active = await readRun(f, state);
+    assert.deepEqual(active.map(row => row.event), ['run_start']);
+    stopping = f.post('/api/stop', { workspace: 'snipe' });
+    await eventually(async () => (await ok(await f.get('/api/state'))).stopping);
+    gate.resolve();
+    assert.equal((await starting).status, 400);
+    const stopped = await ok(await stopping);
+    assert.equal(stopped.snipeReport, state.snipeReport);
+    assert.deepEqual((await readRun(f, stopped)).map(row => row.event), ['run_start', 'watch_stopped', 'run_end']);
+    assert.equal(f.observed.executors.length, 0);
+  } finally { gate.resolve(); await Promise.allSettled([starting, stopping]); }
+});
+
+test('pending receive time is saved while the run is active, and the latest path survives restart', async t => {
+  const f = await fixture(t, { localWallets: true });
+  const body = snipeBodyFor(f);
+  const run = await ok(await f.post('/api/start', body));
+  const { log, cfg: armedConfig } = f.observed.monitors[0];
+  const { mint, token } = armedConfig.targets[0];
+  const pendingTxHash = '0x' + 'fa'.repeat(32);
+  const pendingReceivedAtMs = Date.now() - 17;
+  log('snipe_pending', { mint, token, pendingTxHash, pendingReceivedAtMs, pendingMode: 'full', wallet: checkedWallet,
+    raw: mockKeyOne, secret: mockPassword });
+  const pending = await eventually(async () => {
+    try { return (await readRun(f, run)).find(row => row.event === 'snipe_pending'); }
+    catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+  });
+  assert.equal(pending.pendingTxHash, pendingTxHash);
+  assert.equal(pending.pendingReceivedAtMs, pendingReceivedAtMs);
+  assert.equal(pending.pendingMode, 'full');
+  assert.equal(pending.time, new Date(pendingReceivedAtMs).toISOString());
+  noSecret(pending, f.bootstrap.sessionToken, checkedWallet);
+  const stopped = await ok(await f.post('/api/stop', { workspace: 'snipe' }));
+  const oldRows = await readRun(f, stopped);
+  assert.equal(oldRows.find(row => row.event === 'watch_started').armBlock, f.head);
+  assert.equal(oldRows.at(-1).event, 'run_end');
+  const next = await ok(await f.post('/api/start', body));
+  assert.notEqual(next.snipeReport, stopped.snipeReport);
+  await ok(await f.post('/api/stop', { workspace: 'snipe' }));
+  assert.deepEqual(await readRun(f, stopped), oldRows);
+  const reopened = await createUiServer({ rootDir: f.rootDir, services: f.services });
+  try {
+    assert.equal((await ok(await fetch(reopened.url + '/api/state'))).snipeReport, next.snipeReport);
+    assert.equal((await fetch(reopened.url + '/' + next.snipeReport)).status, 404);
+  } finally { await reopened.close(); }
 });
 
 test('scoped workspace status and preview use verified Corla links without unlocking', async t => {
@@ -737,13 +872,13 @@ test('live workspaces isolate their trade plans and enforce a single running job
 
   // Then arm only the other job. Its low budget must ignore Mint purchases/claims entirely.
   const snipeBody = { ...body, workspace: 'snipe', config: {
-    ...config, maxTotalBnb: '0.0125',
+    ...config, maxTotalBnb: '0.025',
     snipe: { ...config.snipe, amountBnb: '0.01' },
   } };
   const snipeRun = await ok(await f.post('/api/start', snipeBody));
   assert.equal(snipeRun.workspace, 'snipe');
   assert.match(snipeRun.snipeReport, /^reports\/snipe-runs\/snipe-[\w-]+\.ndjson$/);
-  assert.equal(snipeRun.logs.filter(log => log.event === 'watch_started').at(-1).worstCaseBnb, '0.0125');
+  assert.equal(snipeRun.logs.filter(log => log.event === 'watch_started').at(-1).worstCaseBnb, '0.025');
   const snipeCfg = f.observed.monitors[1].cfg;
   assert.equal(snipeCfg.targets.length, 1);
   assert.equal(snipeCfg.targets[0].token, parseMintLink(snipe.url).token);

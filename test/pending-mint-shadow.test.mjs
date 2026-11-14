@@ -146,11 +146,11 @@ function sockets({ chain = '0x38', reject = false } = {}) {
 test('full-object WebSocket negotiates BSC, reports hash-only or mixed without any hash lookups, stops on abort', async t => {
   const { WebSocket, instances, requests } = sockets();
   const stop = new AbortController();
-  const observed = [], status = [];
+  const observed = [], status = [], arrivals = [];
   let now = 100;
   const feed = makePendingTransactionFeed({ wsUrl: 'wss://example.invalid/credentials', signal: stop.signal,
-    services: { WebSocket, clock: () => now, maxPerSecond: 4 },
-    onTransaction: row => observed.push(row.hash), onStatus: row => status.push(row.mode) });
+    services: { WebSocket, clock: () => now, wallClock: () => 1_794_626_238_000 + now, maxPerSecond: 4 },
+    onTransaction: (row, arrival) => { observed.push(row.hash); arrivals.push(arrival); }, onStatus: row => status.push(row.mode) });
   t.after(() => feed.close());
   feed.start();
   await nextTick();
@@ -168,6 +168,10 @@ test('full-object WebSocket negotiates BSC, reports hash-only or mixed without a
   instances[0].push(tx({ hash: hashOf('da') }));
   instances[0].push(tx({ hash: hashOf('db') })); // over local processing cap
   assert.deepEqual(observed, [txHash, hashOf('da')]);
+  assert.deepEqual(arrivals, [
+    { receivedAtMs: 1_794_626_239_100, seen: 1100, mode: 'mixed' },
+    { receivedAtMs: 1_794_626_239_100, seen: 1100, mode: 'mixed' },
+  ]);
   assert.equal(feed.status().droppedMessages, 1);
   stop.abort();
   assert.equal(instances[0].closed, true);

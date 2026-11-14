@@ -1,9 +1,10 @@
-import { formatEther, formatUnits, getAddress, Interface, keccak256, toQuantity } from 'ethers';
+import { formatEther, formatUnits, getAddress, Interface, keccak256, toQuantity, ZeroAddress } from 'ethers';
 import { FACTORY } from '../src/config.mjs';
-import { CORLA_LAUNCH_TOPIC, decodeLaunchCandidate, verifyLaunchCandidate } from '../src/events.mjs';
+import { CORLA_LAUNCH_TOPIC, decodeLaunchCandidate, portalLaunchQuote, verifyLaunchCandidate } from '../src/events.mjs';
 import { ROUTER, WBNB } from '../src/market.mjs';
 import { BUILTIN_WATCH_RPC_URLS } from '../src/rpc-config.mjs';
 import { createRpcPool } from '../src/rpc-pool.mjs';
+import { formatQuoteUnits, readQuoteDecimals } from '../src/quote-assets.mjs';
 
 // A public-chain forensic comparison only: no local configuration, wallets,
 // private RPC credentials, signing, or write methods.
@@ -29,12 +30,20 @@ try {
   const h = Number(launchReceipt.blockNumber);
   const tag = toQuantity(h);
   const logs = launchReceipt.logs.filter(log => low(log.topics?.[0]) === CORLA_LAUNCH_TOPIC);
-  if (logs.length !== 1 || !/^0x0{24}[a-f0-9]{40}$/i.test(logs[0].topics?.[1] ?? '')) throw new Error('No unique Corla launch event');
+  if (logs.length !== 1 || ![1, 2].every(i => /^0x0{24}[a-f0-9]{40}$/i.test(logs[0].topics?.[i] ?? ''))) {
+    throw new Error('No unique Corla launch event');
+  }
+  const tokenAddr = getAddress('0x' + logs[0].topics[1].slice(-40));
+  const poolAddr = getAddress('0x' + logs[0].topics[2].slice(-40));
+  const launchQuotes = launchReceipt.logs.map(log => portalLaunchQuote(log, tokenAddr, poolAddr)).filter(x => x !== null);
+  if (launchQuotes.length !== 1) throw new Error('No unique Portal payment asset');
+  const [quoteToken] = launchQuotes;
+  const payment = quoteToken === ZeroAddress ? WBNB : quoteToken;
   const candidate = decodeLaunchCandidate({
-    factory: FACTORY, mint: getAddress(logs[0].address), token: getAddress('0x' + logs[0].topics[1].slice(-40)),
+    factory: FACTORY, mint: getAddress(logs[0].address), token: tokenAddr, quoteToken,
   }, logs[0], h, h);
   const proven = await verifyLaunchCandidate(provider, candidate);
-  if (!proven) throw new Error('No matching Corla launch, Portal and liquidity evidence');
+  if (!proven?.openingReserves) throw new Error('No matching Corla launch, Portal and liquidity evidence');
   const { pool, token } = proven;
   const [head, nextHead, buyHead, beforeCode, afterCode, swapLogs, order] = await Promise.all([
     provider.send('eth_getBlockByNumber', [tag, true]),
@@ -51,19 +60,21 @@ try {
   if (low(head?.hash) !== low(launchReceipt.blockHash) || low(buyHead?.hash) !== low(buyReceipt.blockHash)) {
     throw new Error('Receipts did not match the canonical blocks');
   }
-  if (!order.includes(low(token)) || !order.includes(low(WBNB))) throw new Error('Not the expected WBNB pair');
+  if (!order.includes(low(token)) || !order.includes(low(payment))) throw new Error('Unexpected pool payment asset');
   if (!nextHead?.hash || swapLogs.some(log => log.removed || low(log.address) !== low(pool) ||
       low(log.blockHash) !== low(log.blockNumber === h ? head.hash : log.blockNumber === h + 1 ? nextHead.hash : undefined))) {
     throw new Error('Swap logs did not match the canonical pair and blocks');
   }
-  const firstIsWbnb = order[0] === low(WBNB);
+  const quoteFirst = order[0] === low(payment);
   const buys = swapLogs.flatMap(log => {
     const { args } = swapAbi.parseLog(log);
-    const wbnb = args[firstIsWbnb ? 'amount0In' : 'amount1In'];
-    const tokenOut = args[firstIsWbnb ? 'amount1Out' : 'amount0Out'];
-    return wbnb > 0n && tokenOut > 0n ? [{ log, wbnb }] : [];
+    const paid = args[quoteFirst ? 'amount0In' : 'amount1In'];
+    const tokenOut = args[quoteFirst ? 'amount1Out' : 'amount0Out'];
+    return paid > 0n && tokenOut > 0n ? [{ log, paid }] : [];
   }).sort((a, b) => a.log.blockNumber - b.log.blockNumber || a.log.transactionIndex - b.log.transactionIndex);
   const matched = buys.filter(row => low(row.log.transactionHash) === low(buyHash));
+  const rawPayment = matched.reduce((sum, row) => sum + row.paid, 0n);
+  const quoteDecimals = await readQuoteDecimals(provider, quoteToken, h).catch(() => null);
   const sameCall = t => low(t.to) === low(buy.to) && t.input === buy.input;
   const comparable = head.transactions.filter(sameCall);
   const samples = await Promise.allSettled(comparable.slice(0, 64).map(t => receipt(t.hash)));
@@ -78,7 +89,10 @@ try {
     launch: { hash: launchHash, block: h, index: Number(launchReceipt.transactionIndex) },
     suppliedBuy: { hash: buyHash, block: Number(buyReceipt.blockNumber), index: Number(buyReceipt.transactionIndex),
       firstBuyInScannedBlocks: Boolean(buys.length && low(buys[0].log.transactionHash) === low(buyHash)),
-      poolWbnbIn: formatEther(matched.reduce((sum, row) => sum + row.wbnb, 0n)),
+      ...(quoteToken === ZeroAddress ? { poolWbnbIn: formatEther(rawPayment) } : {
+        paymentToken: payment, poolQuoteInUnits: rawPayment.toString(),
+        poolQuoteIn: quoteDecimals === null ? null : formatQuoteUnits(rawPayment, quoteDecimals),
+      }),
       standardRouterDestination: low(buy.to) === low(ROUTER), destination: buy.to,
       calldataBytes: (buy.input.length - 2) / 2, selector: buy.input.slice(0, 10), valueBnb: formatEther(buy.value),
       gasUsed: Number(buyReceipt.gasUsed), gasPriceGwei: formatUnits(buyReceipt.effectiveGasPrice, 9),

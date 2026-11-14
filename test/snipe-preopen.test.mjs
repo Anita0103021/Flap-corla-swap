@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AbiCoder, Interface, Transaction, Wallet, ZeroAddress, id, parseEther, toQuantity } from 'ethers';
 import { FACTORY } from '../src/config.mjs';
-import { CORLA_ABI } from '../src/corla.mjs';
+import { CORLA_ABI, CORLA_QUOTE_ABI } from '../src/corla.mjs';
 import { DIRECT_LAUNCH_PORTAL } from '../src/events.mjs';
 import { makeExecutor } from '../src/execution.mjs';
-import { PANCAKE_FACTORY, ROUTER, WBNB, v2Output } from '../src/market.mjs';
+import { PANCAKE_FACTORY, ROUTER, ROUTER_ABI, WBNB, v2Output } from '../src/market.mjs';
+import { QUOTE_ERC20 } from '../src/quote-assets.mjs';
 import { buildPreopenBuyPlan, isVerifiedPreopenBuyPlan } from '../src/snipe-preopen.mjs';
 
 const target = { factory: FACTORY, mint: '0x0000000000000000000000000000000000000033', token: '0x0000000000000000000000000000000000000044' };
@@ -35,36 +36,51 @@ const token = new Interface(['event Transfer(address indexed from,address indexe
 const router = new Interface(['function getAmountsOut(uint256,address[]) view returns (uint256[])',
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,address[],address,uint256) payable',
   'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)']);
-const portalData = AbiCoder.defaultAbiCoder().encode(
+const portalData = quoteToken => AbiCoder.defaultAbiCoder().encode(
   ['tuple(uint256,uint256,uint8,address,uint8,uint256,string,string,string,address,uint256,uint8,uint16)'],
-  [[1, 1, 0, ZeroAddress, 1, 1, 'sample', 'sample', '', pool, reserveToken, 0, 0]],
+  [[1, 1, 0, quoteToken, 1, 1, 'sample', 'sample', '', pool, reserveToken, 0, 0]],
 );
 const event = (abi, name, address, args) => ({ address, ...abi.encodeEventLog(abi.getEvent(name), args) });
 
 async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader = false, badSeed = false,
-  failedBuy = false, badTokenCode = false, fakeMinterNonce = false, omittedSwap = false } = {}) {
+  failedBuy = false, badTokenCode = false, fakeMinterNonce = false, omittedSwap = false,
+  quoteToken = ZeroAddress, shortAllowance = false, differentQuote } = {}) {
   const signer = Wallet.createRandom();
   const pricePerLot = parseEther('0.05');
-  const input = CORLA_ABI.encodeFunctionData('mint', [[]]);
-  const signed = Transaction.from(await signer.signTransaction({ type: 2, chainId: 56, nonce: 5, to: target.mint,
-    data: input, value: pricePerLot, gasLimit: 9_000_000, maxFeePerGas: 80_000_000n, maxPriorityFeePerGas: 80_000_000n }));
-  const pending = { to: target.mint, from: signer.address, hash: badHash ? '0x' + 'cd'.repeat(32) : signed.hash,
-    chainId: '0x38', type: '0x2', nonce: '0x5', gas: toQuantity(signed.gasLimit), value: toQuantity(pricePerLot), input,
+  const tokenQuote = quoteToken !== ZeroAddress;
+  const deploymentKey = '0x' + '33'.repeat(32);
+  const armed = tokenQuote ? { ...target, quoteToken, deploymentKey, pricePerLot } : target;
+  const trade = tokenQuote ? { ...settings, quoteToken, quoteDecimals: 6 } : settings;
+  const to = tokenQuote ? FACTORY : target.mint;
+  const asset = tokenQuote ? quoteToken : WBNB;
+  const value = tokenQuote ? 0n : pricePerLot;
+  const input = tokenQuote ? CORLA_QUOTE_ABI.encodeFunctionData('mintQuote', [deploymentKey, []]) : CORLA_ABI.encodeFunctionData('mint', [[]]);
+  const signed = Transaction.from(await signer.signTransaction({ type: 2, chainId: 56, nonce: 5, to,
+    data: input, value, gasLimit: 9_000_000, maxFeePerGas: 80_000_000n, maxPriorityFeePerGas: 80_000_000n }));
+  const pending = { to, from: signer.address, hash: badHash ? '0x' + 'cd'.repeat(32) : signed.hash,
+    chainId: '0x38', type: '0x2', nonce: '0x5', gas: toQuantity(signed.gasLimit), value: toQuantity(value), input,
     maxFeePerGas: toQuantity(signed.maxFeePerGas), maxPriorityFeePerGas: toQuantity(signed.maxPriorityFeePerGas),
     r: signed.signature.r, s: signed.signature.s, v: toQuantity(signed.signature.yParity), accessList: [], blockNumber: null };
-  const state = { blockNumber: head.number, phase: 1, launched: false, emergencyWithdrawn: false, quoteToken: ZeroAddress,
+  const state = { blockNumber: head.number, phase: 1, launched: false, emergencyWithdrawn: false, quoteToken, quoteDecimals: 6, deploymentKey,
     token: ZeroAddress, pool: ZeroAddress, fundingDeadline: 90_000n, pricePerLot, mintedLots: 99n, totalLots: 100n, ...patchState };
   const success = (returnData = '0x', logs = [], gasUsed = '0x5208') => ({ status: '0x1', returnData, logs, gasUsed });
   const minted = () => success('0x', [
     event(CORLA_ABI, 'Minted', target.mint, [signer.address, 100]),
     event(CORLA_ABI, 'Launched', target.mint, [target.token, pool, signer.address]),
-    event(portal, 'FlapDirectLaunched', DIRECT_LAUNCH_PORTAL, [target.token, 0, target.mint, id('DirectLaunchV2(DirectLaunchV2Data)'), portalData]),
-    event(factory, 'PairCreated', PANCAKE_FACTORY, [target.token, WBNB, pool, 1]),
+    event(portal, 'FlapDirectLaunched', DIRECT_LAUNCH_PORTAL, [target.token, 0, target.mint, id('DirectLaunchV2(DirectLaunchV2Data)'), portalData(differentQuote ?? quoteToken)]),
+    event(factory, 'PairCreated', PANCAKE_FACTORY, [target.token, asset, pool, 1]),
     event(pair, 'Mint', pool, [DIRECT_LAUNCH_PORTAL, reserveToken, reserveBnb]),
     event(pair, 'Sync', pool, [badSeed ? reserveToken - 1n : reserveToken, reserveBnb]),
   ]);
   const api = [];
   const provider = {
+    async call({ to, data, blockTag }) {
+      assert.equal(to, quoteToken); assert.equal(blockTag, head.number);
+      const { name, args } = QUOTE_ERC20.parseTransaction({ data });
+      assert.ok(name === 'balanceOf' || name === 'allowance');
+      if (name === 'allowance') assert.equal(args[1], args[0] === wallet ? ROUTER : FACTORY);
+      return QUOTE_ERC20.encodeFunctionResult(name, [name === 'allowance' && shortAllowance ? 0n : parseEther('100')]);
+    },
     getCode: async (address, block) => {
       assert.equal(address, target.token); assert.equal(block, head.number);
       return badTokenCode ? '0x01' : '0x';
@@ -106,9 +122,9 @@ async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader 
       return [{ parentHash: head.hash, number: toQuantity(head.number + 1), timestamp: toQuantity(head.timestamp + 1), calls }];
     },
   };
-  return { api, run: () => buildPreopenBuyPlan(provider, target, pending, wallet, settings, head,
+  return { api, pending, armed, run: () => buildPreopenBuyPlan(provider, armed, pending, wallet, trade, head,
     { services: { inspectMint: async (_provider, checked, block) => {
-      assert.deepEqual(checked, target); assert.equal(block, head.number); return state;
+      assert.deepEqual(checked, armed); assert.equal(block, head.number); return state;
     } } }) };
 }
 
@@ -137,6 +153,24 @@ test('preopen plan independently verifies exact signed final mint and uses the i
   assert.deepEqual([...decoded[1]], [WBNB, target.token]);
   assert.equal(decoded[2], wallet);
   assert.equal(decoded[3], BigInt(deadline));
+});
+
+test('preopen uses the factory Mint and verified ERC-20 purchase and sale paths', async () => {
+  const quoteToken = '0x0000000000000000000000000000000000000088';
+  const { run, api } = await fixture({ quoteToken });
+  const plan = await run();
+  const [mint, , , , , , buy, , sell] = api[1];
+  assert.equal(mint.to, FACTORY);
+  assert.equal(mint.value, '0x0');
+  assert.equal(plan.quoteToken, quoteToken);
+  assert.equal(plan.tx.value, 0n);
+  const parsed = ROUTER_ABI.parseTransaction({ data: buy.data });
+  assert.equal(parsed.name, 'swapExactTokensForTokensSupportingFeeOnTransferTokens');
+  assert.equal(parsed.args[0], settings.amountIn);
+  assert.deepEqual([...parsed.args[2]], [quoteToken, target.token]);
+  assert.deepEqual([...ROUTER_ABI.parseTransaction({ data: sell.data }).args[2]], [target.token, quoteToken]);
+  await assert.rejects((await fixture({ quoteToken, shortAllowance: true })).run, /余额或授权额度不足/);
+  await assert.rejects((await fixture({ quoteToken, differentQuote: ZeroAddress })).run, /支付币匹配/);
 });
 
 test('preopen refuses non-final, already deployed, mismatched nonce, and forged signed-hash candidates before simulation', async () => {

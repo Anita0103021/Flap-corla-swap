@@ -187,7 +187,7 @@ export function createNotificationFeed({ provider, services = {} }) {
           const states = await svc.readDashboardProjects(provider, batch, n);
           for (const row of batch) {
             const chain = states.get(row.mint.toLowerCase());
-            if (chain?.error && /不支持|不一致|仅支持|未在/.test(chain.error)) continue;
+            if (chain?.error && /不支持|不一致|冲突|未在/.test(chain.error)) continue;
             if (!chain || chain.error || chain.blockNumber !== n) throw new Error('Corla 通知未能核对新项目白名单');
             if (chain.whitelistEnabled === true && unix(Number(chain.whitelistDeadline)) &&
                 Number(chain.whitelistDeadline) >= head.timestamp) {

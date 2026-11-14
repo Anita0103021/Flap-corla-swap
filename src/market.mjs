@@ -1,4 +1,5 @@
 import { Contract, Interface, ZeroAddress, getAddress, toQuantity, parseEther } from 'ethers';
+import { QUOTE_ERC20, quoteAsset, requireQuoteFunds } from './quote-assets.mjs';
 
 export const ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
 export const WBNB = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
@@ -9,10 +10,11 @@ const TOKEN = new Interface([
   'function sellTaxRate() view returns (uint16)',
   'function approve(address,uint256) returns (bool)',
 ]);
-const ROUTER_ABI = new Interface([
+export const ROUTER_ABI = new Interface([
   'function getAmountsOut(uint256,address[]) view returns (uint256[])',
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256,address[],address,uint256) payable',
   'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)',
+  'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)',
 ]);
 const FACTORY = new Interface(['function getPair(address,address) view returns (address)']);
 const PAIR = new Interface([
@@ -28,19 +30,19 @@ export function v2Output(amount, reserveIn, reserveOut) {
   const amountWithFee = amount * 9975n;
   return amountWithFee * reserveOut / (reserveIn * BPS + amountWithFee);
 }
-export function marketLimits({ amountIn, reserveBnb, reserveToken, quoted, buyTax, sellTax, settings }) {
-  if (reserveBnb < settings.minLiquidity || reserveToken <= 0n) throw new Error('Pancake V2 储备低于门槛');
+export function marketLimits({ amountIn, reserveBnb, reserveQuote = reserveBnb, reserveToken, quoted, buyTax, sellTax, settings }) {
+  if (reserveQuote < settings.minLiquidity || reserveToken <= 0n) throw new Error('Pancake V2 储备低于门槛');
   if (buyTax > BigInt(settings.maxBuyTaxBps) || sellTax > BigInt(settings.maxSellTaxBps)) {
     throw new Error('买入或卖出税超过配置阈值');
   }
-  const spot = amountIn * reserveToken / reserveBnb;
-  if (spot <= 0n || quoted <= 0n || quoted >= reserveToken || quoted !== v2Output(amountIn, reserveBnb, reserveToken)) {
+  const spot = amountIn * reserveToken / reserveQuote;
+  if (spot <= 0n || quoted <= 0n || quoted >= reserveToken || quoted !== v2Output(amountIn, reserveQuote, reserveToken)) {
     throw new Error('路由报价与池子储备不一致');
   }
   const priceImpactBps = (BPS * (spot - quoted) + spot - 1n) / spot;
   if (priceImpactBps > BigInt(settings.maxPriceImpactBps)) throw new Error('价格冲击超过配置阈值');
   const amountOutMin = discount(discount(quoted, buyTax), settings.slippageBps);
-  const reverse = v2Output(discount(amountOutMin, sellTax), reserveToken - quoted, reserveBnb + amountIn);
+  const reverse = v2Output(discount(amountOutMin, sellTax), reserveToken - quoted, reserveQuote + amountIn);
   const reverseMin = discount(reverse, settings.slippageBps);
   if (amountOutMin <= 0n || reverseMin <= 0n) throw new Error('最低成交量计算为零');
   return { amountOutMin, reverseMin, priceImpactBps };
@@ -58,12 +60,12 @@ export function applyOpeningPriceGuard(market, openingReserves, openingBuyTax, s
   if (!Number.isSafeInteger(maxOpeningPremiumBps) || maxOpeningPremiumBps < 0 || maxOpeningPremiumBps > 1000) {
     throw new Error('开盘价溢价上限必须在 0–10% 之间');
   }
-  const { reserveBnb, reserveToken } = openingReserves ?? {};
-  if (typeof reserveBnb !== 'bigint' || typeof reserveToken !== 'bigint' || reserveBnb <= 0n || reserveToken <= 0n ||
+  const { reserveBnb, reserveQuote = reserveBnb, reserveToken } = openingReserves ?? {};
+  if (typeof reserveQuote !== 'bigint' || typeof reserveToken !== 'bigint' || reserveQuote <= 0n || reserveToken <= 0n ||
       typeof openingBuyTax !== 'bigint' || openingBuyTax < 0n || openingBuyTax >= BPS) {
     throw new Error('未能核验初始池储备或开盘买税，不追价');
   }
-  const openingNetOut = discount(v2Output(settings.amountIn, reserveBnb, reserveToken), openingBuyTax);
+  const openingNetOut = discount(v2Output(settings.amountIn, reserveQuote, reserveToken), openingBuyTax);
   const quotedNetOut = discount(market.quoted, market.buyTax);
   if (openingNetOut <= 0n || quotedNetOut <= 0n) throw new Error('开盘价格保护无法计算有效净报价');
   // Cap the unit price, not percentage loss of output; round towards safety.
@@ -75,7 +77,7 @@ export function applyOpeningPriceGuard(market, openingReserves, openingBuyTax, s
   }
   if (market.amountOutMin >= openingAmountOutMin) return { ...market, ...priceEvidence };
   const reverse = v2Output(discount(openingAmountOutMin, market.sellTax),
-    market.reserveToken - market.quoted, market.reserveBnb + settings.amountIn);
+    market.reserveToken - market.quoted, (market.reserveQuote ?? market.reserveBnb) + settings.amountIn);
   const reverseMin = discount(reverse, settings.slippageBps);
   if (reverseMin <= 0n) throw new Error('最低卖出量计算为零');
   return { ...market, ...priceEvidence, amountOutMin: openingAmountOutMin, reverseMin };
@@ -92,33 +94,69 @@ export async function readMarket(provider, target, state, settings, block) {
   const factory = new Contract(PANCAKE_FACTORY, FACTORY, provider);
   const pair = new Contract(pool, PAIR, provider);
   const router = new Contract(ROUTER, ROUTER_ABI, provider);
-  const path = [WBNB, target.token];
+  const quoteToken = quoteAsset(settings.quoteToken);
+  if (state.quoteToken !== undefined && quoteAsset(state.quoteToken) !== quoteToken) throw new Error('开盘池支付币与配置不一致');
+  const native = quoteToken === ZeroAddress;
+  const asset = native ? WBNB : quoteToken;
+  if (same(asset, target.token)) throw new Error('买入币与支付币相同');
+  const path = [asset, target.token];
   // The launch receipt already names the candidate pair. Read everything in
   // one fan-out, but do not trust that pair until the token and the canonical
   // factory independently agree. Quote/reserve checks below still apply.
   const [mainPool, pairAddress, buyTax, sellTax, token0, token1, reserves, amounts] = await Promise.all([
-    token.mainPool(opts), factory.getPair(WBNB, target.token, opts), token.buyTaxRate(opts), token.sellTaxRate(opts),
+    token.mainPool(opts), factory.getPair(...path, opts), token.buyTaxRate(opts), token.sellTaxRate(opts),
     pair.token0(opts), pair.token1(opts), pair.getReserves(opts), router.getAmountsOut(settings.amountIn, path, opts),
   ]);
   if (!same(mainPool, pool) || !same(pairAddress, pool)) throw new Error('Corla、Token 和 Pancake V2 的交易池不一致');
-  const wbnbFirst = same(token0, WBNB);
-  if (!(wbnbFirst ? same(token1, target.token) : same(token0, target.token) && same(token1, WBNB))) {
-    throw new Error('池子不是预期的 WBNB/Token 直连路径');
+  const quoteFirst = same(token0, asset);
+  if (!(quoteFirst ? same(token1, target.token) : same(token0, target.token) && same(token1, asset))) {
+    throw new Error('池子不是预期的支付币/Token 直连路径');
   }
-  const [reserveBnb, reserveToken] = wbnbFirst ? reserves : [reserves[1], reserves[0]];
+  const [reserveQuote, reserveToken] = quoteFirst ? reserves : [reserves[1], reserves[0]];
+  if (amounts.length !== 2 || amounts[0] !== settings.amountIn) throw new Error('路由报价与池子储备不一致');
   const quoted = amounts[1];
-  const limits = marketLimits({ amountIn: settings.amountIn, reserveBnb, reserveToken, quoted, buyTax, sellTax, settings });
-  return { pair: pairAddress, quoted, buyTax, sellTax, reserveBnb, reserveToken, path, ...limits, blockNumber: block.number };
+  const limits = marketLimits({ amountIn: settings.amountIn, reserveQuote, reserveToken, quoted, buyTax, sellTax, settings });
+  return { pair: pairAddress, quoted, buyTax, sellTax, ...(native ? { reserveBnb: reserveQuote } : { reserveQuote, quoteToken }),
+    reserveToken, path, ...limits, blockNumber: block.number };
 }
 
 export function buildBuy(market, wallet, settings, block) {
   const deadline = block.timestamp + settings.deadlineSeconds;
+  const quoteToken = quoteAsset(settings.quoteToken);
+  if (quoteToken !== ZeroAddress) {
+    if (!same(market.path[0], quoteToken)) throw new Error('买入路径与支付币不一致');
+    return { to: ROUTER, value: 0n,
+      data: ROUTER_ABI.encodeFunctionData('swapExactTokensForTokensSupportingFeeOnTransferTokens',
+        [settings.amountIn, market.amountOutMin, market.path, wallet, deadline]) };
+  }
   return {
     to: ROUTER,
     data: ROUTER_ABI.encodeFunctionData('swapExactETHForTokensSupportingFeeOnTransferTokens',
       [market.amountOutMin, market.path, wallet, deadline]),
     value: settings.amountIn,
   };
+}
+
+export function buildSimulatedSell(path, amount, reverseMin, wallet, deadline, quoteToken) {
+  const method = quoteAsset(quoteToken) === ZeroAddress
+    ? 'swapExactTokensForETHSupportingFeeOnTransferTokens'
+    : 'swapExactTokensForTokensSupportingFeeOnTransferTokens';
+  return ROUTER_ABI.encodeFunctionData(method, [amount, reverseMin, [path[1], path[0]], wallet, deadline]);
+}
+
+function simulatedPayment(logs, token, from, recipient) {
+  if (!Array.isArray(logs) || logs.length > 1024) return 0n;
+  let amount = 0n;
+  for (const log of logs) {
+    if (typeof log?.address !== 'string' || !same(log.address, token)) continue;
+    try {
+      const transfer = QUOTE_ERC20.parseLog(log);
+      if (transfer?.name === 'Transfer' && same(transfer.args.from, from) && same(transfer.args.to, recipient)) {
+        amount += transfer.args.value;
+      }
+    } catch { /* Only exact Transfer events count. */ }
+  }
+  return amount;
 }
 
 export async function verifyRoundTrip(provider, market, wallet, settings, block, { fundSimulation = false, buyTx } = {}) {
@@ -135,12 +173,13 @@ export async function verifyRoundTrip(provider, market, wallet, settings, block,
     throw new Error('预构建买单与模拟买单不一致；已跳过，不会发单');
   }
   const target = market.path[1];
+  const quoteToken = quoteAsset(settings.quoteToken);
+  if (quoteToken !== ZeroAddress) await requireQuoteFunds(provider, quoteToken, wallet, ROUTER, settings.amountIn, block.number);
   const deadline = block.timestamp + settings.deadlineSeconds;
   const calls = [
     { from: wallet, to: tx.to, data: tx.data, value: toQuantity(tx.value) },
     { from: wallet, to: target, data: TOKEN.encodeFunctionData('approve', [ROUTER, market.amountOutMin]) },
-    { from: wallet, to: ROUTER, data: ROUTER_ABI.encodeFunctionData('swapExactTokensForETHSupportingFeeOnTransferTokens',
-      [market.amountOutMin, market.reverseMin, [target, WBNB], wallet, deadline]) },
+    { from: wallet, to: ROUTER, data: buildSimulatedSell(market.path, market.amountOutMin, market.reverseMin, wallet, deadline, quoteToken) },
   ];
   const blockCalls = {
     // Geth's default simulated timestamp adds 12s. BSC next block is faster.
@@ -159,6 +198,12 @@ export async function verifyRoundTrip(provider, market, wallet, settings, block,
   const results = simulation?.[0]?.calls;
   if (!Array.isArray(results) || results.length !== calls.length || results.some(r => r.status !== '0x1')) {
     throw new Error('买入→授权→卖出模拟未全部通过；已跳过，不会发单');
+  }
+  if (quoteToken !== ZeroAddress &&
+      (simulatedPayment(results[0].logs, quoteToken, wallet, market.pair) !== settings.amountIn ||
+      simulatedPayment(results[0].logs, target, market.pair, wallet) < market.amountOutMin ||
+      simulatedPayment(results[2].logs, quoteToken, market.pair, wallet) < market.reverseMin)) {
+    throw new Error('模拟未核验支付币实际扣款或买卖到账；未发送');
   }
   return tx; // The approval and sell calldata are simulation-only.
 }

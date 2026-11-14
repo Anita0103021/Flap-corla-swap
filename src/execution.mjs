@@ -3,15 +3,18 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { Interface, Transaction, Wallet, ZeroAddress, getAddress, isHexString } from 'ethers';
 import { ROUTER, WBNB } from './market.mjs';
+import { MAX_BROADCAST_CONCURRENCY } from './rpc-config.mjs';
 import { isDefinitelyNotSubmitted } from './rpc-pool.mjs';
 import { isVerifiedPreopenBuyPlan } from './snipe-preopen.mjs';
+import { quoteAsset } from './quote-assets.mjs';
+import { MAX_SNIPE_ATTEMPTS } from './snipe-limits.mjs';
 
 const BSC = 56n;
 const UINT256_MAX = (1n << 256n) - 1n;
 const REORG_MONITOR_DEPTH = 12;
-const RACE_MAX_ATTEMPTS = 5;
 const RACE_BUY = new Interface([
   'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin,address[] path,address to,uint256 deadline) payable',
+  'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn,uint256 amountOutMin,address[] path,address to,uint256 deadline)',
 ]);
 
 function addressOf(wallet) {
@@ -43,8 +46,20 @@ function checkedRaceBase(actionId) {
   return actionId;
 }
 
+const raceAttemptsTable = (name, ifNotExists = false) => `
+  CREATE TABLE ${ifNotExists ? 'IF NOT EXISTS ' : ''}${name} (
+    wallet TEXT NOT NULL,
+    base_action_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND ${MAX_SNIPE_ATTEMPTS}),
+    action_id TEXT NOT NULL,
+    max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND ${MAX_SNIPE_ATTEMPTS}),
+    PRIMARY KEY(wallet, base_action_id, attempt),
+    UNIQUE(wallet, action_id)
+  ) STRICT;`;
+
 const raceAttemptId = (actionId, ordinal) => actionId + ':race:' + ordinal;
-const fitsRaceIntent = (stored, intent) => stored.token === intent.token && stored.amount_in === intent.amountIn &&
+const fitsRaceIntent = (stored, intent) => stored.token === intent.token && stored.quote_token === intent.quoteToken &&
+  stored.amount_in === intent.amountIn &&
   BigInt(stored.min_out) <= BigInt(intent.minOut);
 
 /** Load encrypted ethers JSON keystores; passwords only come from the specified environment variables. */
@@ -121,24 +136,37 @@ function openJournal(path) {
         action_id TEXT NOT NULL,
         PRIMARY KEY(wallet, action_id)
       ) STRICT;
-      CREATE TABLE IF NOT EXISTS race_attempts (
-        wallet TEXT NOT NULL,
-        base_action_id TEXT NOT NULL,
-        attempt INTEGER NOT NULL CHECK(attempt BETWEEN 1 AND 5),
-        action_id TEXT NOT NULL,
-        max_attempts INTEGER NOT NULL CHECK(max_attempts BETWEEN 1 AND 5),
-        PRIMARY KEY(wallet, base_action_id, attempt),
-        UNIQUE(wallet, action_id)
-      ) STRICT;
+      ${raceAttemptsTable('race_attempts', true)}
       CREATE TABLE IF NOT EXISTS race_intents (
         wallet TEXT NOT NULL,
         base_action_id TEXT NOT NULL,
         token TEXT NOT NULL,
         amount_in TEXT NOT NULL,
         min_out TEXT NOT NULL,
+        quote_token TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000',
         PRIMARY KEY(wallet, base_action_id)
       ) STRICT;
     `);
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const { sql } = db.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='race_attempts'").get();
+      if (/\bBETWEEN\s+1\s+AND\s+5\b/i.test(sql)) {
+        // The bounds were baked into SQLite. Keep the original cap and
+        // attempt IDs for existing series; only new series get the new cap.
+        db.exec(`${raceAttemptsTable('race_attempts_new')}
+          INSERT INTO race_attempts_new (wallet, base_action_id, attempt, action_id, max_attempts)
+            SELECT wallet, base_action_id, attempt, action_id, max_attempts FROM race_attempts;
+          DROP TABLE race_attempts;
+          ALTER TABLE race_attempts_new RENAME TO race_attempts;`);
+      }
+      if (!db.prepare('PRAGMA table_info(race_intents)').all().some(column => column.name === 'quote_token')) {
+        db.exec("ALTER TABLE race_intents ADD COLUMN quote_token TEXT NOT NULL DEFAULT '0x0000000000000000000000000000000000000000'");
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    }
     const joined = `SELECT a.*, e.block_height, e.block_hash, e.orphaned, e.stable
       FROM actions a LEFT JOIN receipt_evidence e ON e.tx_hash=a.tx_hash`;
     const byId = db.prepare(`${joined} WHERE a.wallet=? AND a.action_id=?`);
@@ -164,8 +192,8 @@ function openJournal(path) {
     const sealRefusal = db.prepare('INSERT OR IGNORE INTO one_shot_refusals VALUES(?,?)');
     const attempts = db.prepare('SELECT * FROM race_attempts WHERE wallet=? AND base_action_id=? ORDER BY attempt');
     const recordAttempt = db.prepare('INSERT INTO race_attempts VALUES(?,?,?,?,?)');
-    const intent = db.prepare('SELECT token,amount_in,min_out FROM race_intents WHERE wallet=? AND base_action_id=?');
-    const recordIntent = db.prepare('INSERT INTO race_intents VALUES(?,?,?,?,?)');
+    const intent = db.prepare('SELECT token,amount_in,min_out,quote_token FROM race_intents WHERE wallet=? AND base_action_id=?');
+    const recordIntent = db.prepare('INSERT INTO race_intents(wallet,base_action_id,token,amount_in,min_out,quote_token) VALUES(?,?,?,?,?,?)');
     return {
       find: (wallet, actionId) => byId.get(wallet, actionId),
       refused: (wallet, actionId) => Boolean(refused.get(wallet, actionId)),
@@ -257,7 +285,7 @@ function openJournal(path) {
           insert.run(wallet, actionId, hash, nonce, new Date().toISOString());
           if (race) {
             recordAttempt.run(wallet, race.base, race.attempt, actionId, race.maxAttempts);
-            if (race.attempt === 1) recordIntent.run(wallet, race.base, race.intent.token, race.intent.amountIn, race.intent.minOut);
+            if (race.attempt === 1) recordIntent.run(wallet, race.base, race.intent.token, race.intent.amountIn, race.intent.minOut, race.intent.quoteToken);
           }
           db.exec('COMMIT'); // Persist the hash before the signed payload ever leaves the process.
           return { staged: byId.get(wallet, actionId) };
@@ -283,18 +311,26 @@ function checkRequest(tx) {
   return { to, data: data.toLowerCase(), value: uint(tx.value ?? 0n, 'Transaction value') };
 }
 
-function parseRaceBuy(call, address) {
-  if (call.to !== ROUTER || call.value <= 0n) throw new Error('Race requires the Pancake router and a positive buy amount');
+function parseRaceBuy(call, address, payment) {
+  const quoteToken = quoteAsset(payment);
+  const native = quoteToken === ZeroAddress;
+  if (call.to !== ROUTER || (native ? call.value <= 0n : call.value !== 0n)) {
+    throw new Error('Race requires the Pancake router and a valid buy amount');
+  }
   try {
     const parsed = RACE_BUY.parseTransaction({ data: call.data });
-    const [minOut, path, recipient, deadline] = parsed.args;
-    if (minOut <= 0n || deadline <= 0n || recipient !== address || path.length !== 2 || path[0] !== WBNB ||
-        path[1] === ZeroAddress || path[1] === WBNB || RACE_BUY.encodeFunctionData(parsed.fragment, parsed.args).toLowerCase() !== call.data) {
+    const expected = native ? 'swapExactETHForTokensSupportingFeeOnTransferTokens' : 'swapExactTokensForTokensSupportingFeeOnTransferTokens';
+    if (parsed?.name !== expected) throw new Error();
+    const [minOut, path, recipient, deadline] = native ? parsed.args : parsed.args.slice(1);
+    const amountIn = native ? call.value : parsed.args[0];
+    if (amountIn <= 0n || minOut <= 0n || deadline <= 0n || recipient !== address || path.length !== 2 ||
+        path[0] !== (native ? WBNB : quoteToken) || path[1] === ZeroAddress || path[1] === path[0] ||
+        RACE_BUY.encodeFunctionData(parsed.fragment, parsed.args).toLowerCase() !== call.data) {
       throw new Error();
     }
-    return { token: path[1].toLowerCase(), amountIn: String(call.value), minOut: String(minOut), deadline };
+    return { token: path[1].toLowerCase(), quoteToken: quoteToken.toLowerCase(), amountIn: String(amountIn), minOut: String(minOut), deadline };
   } catch {
-    throw new Error('Race must be an exact WBNB-to-token buy with nonzero minimum output');
+    throw new Error('Race must be an exact quote-to-token buy with nonzero minimum output');
   }
 }
 
@@ -312,8 +348,8 @@ function requirePreopenBuy(call, address, beforeSign, gasEstimate, plan, base, i
     throw new Error('Pre-open race requires the original verified ordered simulation plan');
   }
   if (intent.minOut !== String(plan.amountOutMin) || intent.deadline !== BigInt(plan.deadline) ||
-      intent.token !== plan.token?.toLowerCase()) {
-    throw new Error('Pre-open race must be an exact WBNB-to-token buy with nonzero minimum output');
+      intent.token !== plan.token?.toLowerCase() || intent.quoteToken !== quoteAsset(plan.quoteToken).toLowerCase()) {
+    throw new Error('Pre-open race must match the verified payment asset and minimum output');
   }
 }
 
@@ -364,11 +400,15 @@ function blockHashAt(block, height) {
  */
 export function makeExecutor({
   provider, wallets, live = false, maxGasPriceWei, gasLimitCap, journalPath,
-  confirmations = 1, receiptTimeoutMs = 12_000, directBroadcast = false, signal,
+  confirmations = 1, receiptTimeoutMs = 12_000, directBroadcast = false, broadcastConcurrency = 1, signal,
 }) {
   const gasPriceCap = uint(maxGasPriceWei, 'Gas price cap', 1n);
   const gasCap = uint(gasLimitCap, 'Gas limit cap', 21_000n);
   if (typeof live !== 'boolean') throw new Error('live must be a boolean');
+  if (!Number.isSafeInteger(broadcastConcurrency) || broadcastConcurrency < 1 ||
+      broadcastConcurrency > MAX_BROADCAST_CONCURRENCY || (broadcastConcurrency > 1 && !directBroadcast)) {
+    throw new Error('Invalid broadcast concurrency for executor');
+  }
   if (!Number.isSafeInteger(confirmations) || confirmations < 1 ||
     !Number.isSafeInteger(receiptTimeoutMs) || receiptTimeoutMs < 0 || receiptTimeoutMs > 120_000) {
     throw new Error('Invalid receipt policy');
@@ -556,14 +596,17 @@ export function makeExecutor({
     };
   }
 
-  async function runAction({ actionId, tx, gasLimitFloor, beforeSign, onBroadcast, singleSubmission, preparedWallet }, address, signer, race) {
+  async function runAction({ actionId, tx, gasLimitFloor, beforeSign, onBroadcast, singleSubmission, preparedWallet,
+    receiptWaitMs = receiptTimeoutMs }, address, signer, race) {
       signal?.throwIfAborted();
+      if (!Number.isSafeInteger(receiptWaitMs) || receiptWaitMs < 0 || receiptWaitMs > 120_000) throw new Error('Invalid receipt policy');
       if (journal?.refused(address, actionId)) return refusedResult(address, actionId);
-      // Generic providers may internally retry 429s/redirects. Strict live
-      // one-shot execution requires the explicitly bounded transport.
+      // Generic providers may internally replay POSTs. Buys require a bounded
+      // submission wave; each endpoint gets at most one copy of the same hash.
       if (live && singleSubmission && typeof provider.submitRawTransaction !== 'function') {
         throw new Error('RPC 不支持单次提交；未发送');
       }
+      const concurrency = singleSubmission ? broadcastConcurrency : 1;
       if (!directBroadcast) await checkNetwork();
       if (journal) {
         const existing = journal.find(address, actionId);
@@ -678,6 +721,8 @@ export function makeExecutor({
       const signMs = Math.round(performance.now() - signBegan);
 
       signal?.throwIfAborted(); // Do not leave a reservation for an aborted signing attempt.
+      // Local time or a launch notification may have changed while signing.
+      race?.beforeDispatch?.();
       const { staged, previous, refused, raceConflict } = journal.stage(address, actionId, hash, nonce, race);
       if (raceConflict) {
         const current = await inspectRace(race?.base ?? actionId, address);
@@ -695,14 +740,17 @@ export function makeExecutor({
       }
       // The hook observes timing only, never sees signed calldata.
       const sendTelemetry = { txHash: hash, walletChecksMs, preflightMs, preflightOverlapped, signMs,
+        ...(singleSubmission ? { broadcastConcurrency: concurrency } : {}),
         ...(race ? { attempt: race.attempt, attemptActionId: actionId } : {}) };
       try { onBroadcast?.('send', sendTelemetry); } catch { /* telemetry cannot change send outcome */ }
       if (signal?.aborted && journal.releaseNotSubmitted(staged, Boolean(race))) signal.throwIfAborted();
       if (signal?.aborted) return { ...resultFor(staged, 'Stopped before submission; check journal'), ...gas };
-      let response;
+      let response, broadcastRpcCount;
       try {
         response = typeof provider.submitRawTransaction === 'function'
-          ? { hash: await provider.submitRawTransaction(signed, { signal, singleSubmission }) }
+          ? { hash: await provider.submitRawTransaction(signed, { signal, singleSubmission, broadcastConcurrency: concurrency,
+            beforeDispatch: race?.beforeDispatch,
+            onDispatch: count => { broadcastRpcCount = count; } }) }
           : directBroadcast
             ? { hash: await provider.send('eth_sendRawTransaction', [signed]) }
             : await provider.broadcastTransaction(signed);
@@ -720,14 +768,14 @@ export function makeExecutor({
       if (typeof response?.hash !== 'string' || response.hash.toLowerCase() !== hash) {
         return { ...resultFor(staged, 'RPC did not return the expected hash; check receipt without resubmitting'), ...gas };
       }
-      try { onBroadcast?.('ack', sendTelemetry); } catch { /* telemetry cannot change send outcome */ }
-      if (signal?.aborted || (directBroadcast && !receiptTimeoutMs)) {
+      try { onBroadcast?.('ack', { ...sendTelemetry, broadcastRpcCount }); } catch { /* telemetry cannot change send outcome */ }
+      if (signal?.aborted || (directBroadcast && !receiptWaitMs)) {
         return { ...resultFor(staged, 'RPC 已接收，等待链上回执'), ...gas };
       }
       let receipt;
-      if (receiptTimeoutMs) {
+      if (receiptWaitMs) {
         try {
-          receipt = await provider.waitForTransaction(hash, confirmations, receiptTimeoutMs);
+          receipt = await provider.waitForTransaction(hash, confirmations, receiptWaitMs);
         } catch {
           // Query again by the locally derived hash; never send a replacement.
         }
@@ -737,7 +785,7 @@ export function makeExecutor({
 
   async function execute(input) {
     const actionId = checkedActionId(input.actionId);
-    if (/^bsc56:0x[0-9a-f]{40}:buy:race:[1-5]$/.test(actionId)) throw new Error('Race ordinal actionId is reserved');
+    if (/^bsc56:0x[0-9a-f]{40}:buy:race:\d+$/.test(actionId)) throw new Error('Race ordinal actionId is reserved');
     const { singleSubmission = false } = input;
     if (typeof singleSubmission !== 'boolean') throw new Error('Invalid raw submission policy');
     return serialized(input.wallet, async (address, signer) => {
@@ -750,12 +798,13 @@ export function makeExecutor({
   }
 
   execute.race = async input => {
-    const { wallet, gasEstimate, maxAttempts, preopenPlan } = input;
+    const { wallet, gasEstimate, maxAttempts, preopenPlan, beforeDispatch } = input;
     const base = checkedRaceBase(input.actionId);
     if (!live || !directBroadcast) throw new Error('Continuous race requires the direct live executor');
-    if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > RACE_MAX_ATTEMPTS) {
-      throw new Error('Race attempts must be between 1 and 5');
+    if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_SNIPE_ATTEMPTS) {
+      throw new Error('Race attempts must be between 1 and ' + MAX_SNIPE_ATTEMPTS);
     }
+    if (beforeDispatch !== undefined && typeof beforeDispatch !== 'function') throw new Error('Invalid race dispatch guard');
     return serialized(wallet, async (address, signer) => {
       signal?.throwIfAborted();
       const history = await inspectRace(base, address);
@@ -764,14 +813,14 @@ export function makeExecutor({
       const attempt = history.entries.length + 1;
       if (attempt > cap) return { ...history.latest, status: 'exhausted', reason: '已达到抢单次数上限，不再提交' };
       const tx = checkRequest(input.tx);
-      const intent = parseRaceBuy(tx, address);
+      const intent = parseRaceBuy(tx, address, input.quoteToken);
       const original = journal.intent(address, base);
       if ((history.entries.length && !original) || (original && !fitsRaceIntent(original, intent))) {
         throw new Error('Race buy differs from the persisted token/amount or weakens its original minimum output; not sent');
       }
       const actionId = raceAttemptId(base, attempt);
       const result = await runAction({ ...input, tx, actionId, singleSubmission: true }, address, signer, {
-        base, attempt, maxAttempts: cap, gasEstimate, preopenPlan, intent, prior: history.prior,
+        base, attempt, maxAttempts: cap, gasEstimate, preopenPlan, beforeDispatch, intent, prior: history.prior,
         knownActionIds: new Set(history.entries.map(row => row.action_id)),
       });
       if (result.actionId === base) return result;
