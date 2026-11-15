@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, writeFile, rename, unlink } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -56,7 +56,7 @@ const assets = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/mint-wallet-selection.js': ['mint-wallet-selection.js', 'text/javascript; charset=utf-8'],
 };
-const postRoutes = new Set(['/api/status', '/api/discover', '/api/config', '/api/start', '/api/stop',
+const postRoutes = new Set(['/api/status', '/api/discover', '/api/config', '/api/start', '/api/stop', '/api/local/lifecycle',
   '/api/wallets/import', '/api/wallets/remove', '/api/wallets/remember-local-unlock', '/api/wallets/forget-local-unlock',
   '/api/project/preview', '/api/project/participants', '/api/project/metadata',
   '/api/project/wallet-balances',
@@ -144,6 +144,7 @@ function safeToken(actual, expected) {
  */
 export async function createUiServer({
   rootDir = defaultRoot, port = 0, host = '127.0.0.1', allowLive = true, allowSimulation = false, services = {},
+  onLifecycle,
 } = {}) {
   if (host !== '127.0.0.1') throw new Error('UI 只能绑定 IPv4 本机回环地址 127.0.0.1');
   const root = resolve(rootDir);
@@ -178,6 +179,9 @@ export async function createUiServer({
   let origin;
   let run = null;
   let closing = false;
+  let closeTask;
+  let serviceAction = null;
+  const serviceControls = typeof onLifecycle === 'function';
   let saving = false;
   let walletWriting = false;
   let reading = false;
@@ -992,6 +996,26 @@ export async function createUiServer({
     }
     return state();
   }
+  function acceptLifecycle(body, res) {
+    if (Object.keys(body).length !== 1 || !['restart', 'exit'].includes(body.action)) {
+      throw new HttpError(400, '请选择重启或退出');
+    }
+    if (!serviceControls) throw new HttpError(409, '该服务进程未启用网页启停');
+    if (saving || walletWriting) throw new HttpError(409, '正在保存配置或钱包，请等保存完成再试');
+    serviceAction = body.action;
+    closing = true;
+    // Acknowledge the intent before closing the HTTP listener. Even a tab
+    // closed during the acknowledgement should not leave the service locked.
+    let invoked = false;
+    const finish = () => {
+      if (invoked) return;
+      invoked = true;
+      void Promise.resolve().then(() => onLifecycle(serviceAction)).catch(() => {});
+    };
+    res.once('finish', finish);
+    res.once('close', finish);
+    return json(res, 202, { action: serviceAction });
+  }
   const server = createServer({ requestTimeout: 15_000, headersTimeout: 10_000 }, async (req, res) => {
     try {
       // Host pinning prevents DNS rebinding; cross-site navigations cannot call APIs.
@@ -1007,9 +1031,13 @@ export async function createUiServer({
         res.end(data);
         return;
       }
+      if (req.method === 'GET' && pathname === '/api/health') {
+        return json(res, 200, { service: 'corla-desk', instance: stateEpoch, action: serviceAction });
+      }
       if (req.method === 'GET' && pathname === '/api/bootstrap') {
         const wallets = await walletSummary();
-        return json(res, 200, { config: visibleConfig(diskConfig), configRevision, source, sessionToken, allowLive, snipeTiming, ...wallets });
+        return json(res, 200, { config: visibleConfig(diskConfig), configRevision, source, sessionToken,
+          allowLive, snipeTiming, serviceControls, serviceInstance: stateEpoch, ...wallets });
       }
       if (req.method === 'GET' && pathname === '/api/state') {
         const since = requestUrl.searchParams.get('since');
@@ -1032,7 +1060,10 @@ export async function createUiServer({
       if (req.method !== 'POST' || !postRoutes.has(pathname)) throw new HttpError(404, '页面不存在');
       if (req.headers.origin !== origin) throw new HttpError(403, '本地会话校验失败，请刷新页面');
       if (!safeToken(session, sessionToken)) throw new HttpError(403, '本地会话已失效，请重新连接。', 'SESSION_EXPIRED');
+      if (closing) throw new HttpError(409, '本地服务正在停止，请稍候', 'SERVICE_STOPPING');
       const body = await readBody(req);
+      if (closing) throw new HttpError(409, '本地服务正在停止，请稍候', 'SERVICE_STOPPING');
+      if (pathname === '/api/local/lifecycle') return acceptLifecycle(body, res);
       if (pathname === '/api/notifications/stream') {
         const enabled = body.enabled;
         if (Object.keys(body).length !== 1 || !enabled || typeof enabled !== 'object' || Array.isArray(enabled) ||
@@ -1103,23 +1134,65 @@ export async function createUiServer({
   origin = 'http://' + host + ':' + server.address().port;
   return {
     server, url: origin,
-    async close() {
+    close() {
+      if (closeTask) return closeTask;
       closing = true;
       catalogFundingAbort.abort();
-      const notificationsClosed = notificationStream.close();
-      const closed = new Promise((ok, fail) => server.close(error => error ? fail(error) : ok()));
-      await stop();
-      await closed;
-      if (svc.makeProvider) {
-        dashboard?.destroy?.();
-        if (metadataRpc !== dashboard) metadataRpc?.destroy?.();
-      }
-      for (const provider of rpcPools.values()) provider.destroy();
-      await Promise.all([catalogFundingWork, notificationsClosed]);
+      closeTask = (async () => {
+        try {
+          // Keep the health check reachable until the current job has drained
+          // and flushed its journal/report, so the page does not announce an
+          // exit before it is safe to release the port.
+          await Promise.all([stop(), notificationStream.close()]);
+        } finally {
+          await new Promise((ok, fail) => server.close(error => error ? fail(error) : ok()));
+          if (svc.makeProvider) {
+            dashboard?.destroy?.();
+            if (metadataRpc !== dashboard) metadataRpc?.destroy?.();
+          }
+          for (const provider of rpcPools.values()) provider.destroy();
+          await catalogFundingWork;
+        }
+      })();
+      return closeTask;
     },
   };
 }
 
+async function recordLauncherError(error) {
+  const message = shortError(error);
+  console.error(message);
+  try {
+    const dir = join(defaultRoot, 'state');
+    await mkdir(dir, { recursive: true });
+    await appendFile(join(dir, 'ui-start.log'), new Date().toISOString() + ' ' + message + '\n', { mode: 0o600 });
+  } catch { /* The launcher can still show a generic error. */ }
+  process.exitCode = 1;
+}
+function restartUi(url) {
+  const port = new URL(url).port;
+  return new Promise((ok, fail) => {
+    // Fixed executable/entry point. The HTTP client supplies no path, flags,
+    // or command. Do not open a second browser tab on a restart.
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--port', port], {
+      detached: true, windowsHide: true, stdio: 'ignore',
+    });
+    child.once('error', fail);
+    child.once('spawn', () => { child.unref(); ok(); });
+  });
+}
+function openUi(url) {
+  if (process.platform === 'win32') {
+    execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url], { windowsHide: true }, () => {});
+  }
+}
+async function isRunningUi(url) {
+  try {
+    const response = await fetch(url + '/api/health', { signal: AbortSignal.timeout(900), redirect: 'error' });
+    const health = response.ok && await response.json();
+    return health?.service === 'corla-desk' && /^[a-f0-9]{16}$/.test(health.instance) && health.action === null;
+  } catch { return false; }
+}
 async function main() {
   const { values } = parseArgs({ options: {
     port: { type: 'string', default: '3924' },
@@ -1130,21 +1203,31 @@ async function main() {
     return;
   }
   requireRuntime();
-  const app = await createUiServer({ port: int(Number(values.port), '端口', 0, 65535) });
+  const port = int(Number(values.port), '端口', 0, 65535);
+  let app, transition;
+  const shutdown = action => {
+    transition ??= (async () => {
+      await app.close();
+      if (action === 'restart') await restartUi(app.url);
+    })().catch(recordLauncherError);
+    return transition;
+  };
+  try {
+    app = await createUiServer({ port, onLifecycle: shutdown });
+  } catch (error) {
+    const url = 'http://127.0.0.1:' + port;
+    if (values.open && error.code === 'EADDRINUSE' && await isRunningUi(url)) {
+      openUi(url);
+      return;
+    }
+    throw error;
+  }
   console.log('Corla 本地控制台: ' + app.url);
   console.log('正式实盘模式。只有在页面确认并解锁钱包后才启动交易。按 Ctrl+C 退出。');
-  if (values.open && process.platform === 'win32') {
-    execFile('rundll32.exe', ['url.dll,FileProtocolHandler', app.url], { windowsHide: true }, () => {});
-  }
-  let stopped = false;
-  const shutdown = async () => {
-    if (stopped) return;
-    stopped = true;
-    try { await app.close(); } catch { process.exitCode = 1; }
-  };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => { void shutdown('exit'); });
+  process.on('SIGTERM', () => { void shutdown('exit'); });
+  if (values.open) openUi(app.url);
 }
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  main().catch(e => { console.error(shortError(e)); process.exitCode = 1; });
+  main().catch(recordLauncherError);
 }

@@ -11,6 +11,7 @@ const state = {
   preview: null, configRevision: '', stateRevision: '', logCursor: '', reloadRequired: '', cancelingStartup: false,
   snipeReport: '', snipeTiming: null,
 };
+const localService = { connected: null, supported: false, instance: '', phase: '' };
 const EXPLORER = 'https://bscscan.com';
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const PRIVATE_KEY = /^(?:0x)?[0-9a-fA-F]{64}$/;
@@ -68,10 +69,34 @@ const viewPositions = new Map();
 const NOTIFICATION_PREFS_KEY = 'corla-desk:notifications:v1';
 const NOTIFICATION_SEEN_KEY = 'corla-desk:notifications:seen:v1';
 const NOTIFICATION_SEEN_LIMIT = 384;
+const NOTIFICATION_METADATA_MS = 1_200;
+const NOTIFICATION_ICON_MS = 1_850;
+const NOTIFICATION_IMAGE = /^https:\/\/flap\.mypinata\.cloud\/ipfs\/(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|b[a-z2-7]{20,104})(?:\/(?!\.{1,2}(?:\/|$))[A-Za-z0-9_.~-]{1,80}){0,4}$/;
+// Historical Corla v4 events, verified on BSC. Previews stay usable even if
+// the chain feed is off or no matching event is happening right now.
+const NOTIFICATION_PREVIEWS = {
+  burst: {
+    // Crossing 1/3: 17 new batches in the 60 s ending at block 133470064.
+    kind: 'burst', name: 'ai16z 正式开启 AI 驱动的链上回购销毁新时代',
+    token: '0x59676E6D3E4479B0ED4831F87EBa9816b8407777', mint: '0xF80b03efCBF3E1DdC54E9952567C5AA3Beb08078',
+    image: 'https://flap.mypinata.cloud/ipfs/bafkreignxyd7jq3244zic7hdlagqkm7uvvzdrvuoic2zfdjgcs5czd2uv4',
+    mintedLots: '17', totalLots: '50',
+  },
+  whitelist: {
+    // Whitelist enabled in the creation block, 133554314.
+    kind: 'whitelist', name: '比特币共建',
+    token: '0x91C8A278B0143c40EbdC1D6158C554f036557777', mint: '0xAbe741d4049cAE0cBB596EEf9a9A836D0A22D8C9',
+    image: 'https://flap.mypinata.cloud/ipfs/bafkreic4twtwy2xeoywohbeyu4lx63fdeqbtbx473usxrxyewmtr64cgzm',
+  },
+};
 const notificationSeen = new Set();
+const notificationMetadataJobs = new Map();
+const notificationIconJobs = new Map();
+const notificationIcons = new Map();
 let notificationPrefs = readNotificationPrefs();
 let notificationStream, notificationRetry, notificationFailures = 0, notificationGeneration = 0;
 let notificationStatus = 'idle', notificationPrompt = false, notificationUnsupported = false, notificationPageUnloaded = false;
+let activeNotificationPreview, notificationTestCount = 0;
 
 function element(tag, cls = '', value) {
   const el = document.createElement(tag);
@@ -226,6 +251,20 @@ function paintMetadata(keys) {
     if (keys.has(key)) paintCatalogMetadata(node, key);
   }
 }
+function rememberProjectMetadata(key, project) {
+  const meta = { name: metaText(project.name), symbol: metaText(project.symbol), image: imageUrl(project.image),
+    description: typeof project.description === 'string' ? project.description.trim().slice(0, 240) : '',
+    initialSupply: catalogInteger(project.initialSupply) };
+  if (!meta.name && !meta.symbol && !meta.image && !meta.description && meta.initialSupply === null) return;
+  const old = metadataCache.get(key);
+  for (const field of Object.keys(meta)) if ((meta[field] == null || meta[field] === '') && old?.[field] != null) meta[field] = old[field];
+  const changed = !old || Object.keys(meta).some(field => old[field] !== meta[field]);
+  const hint = Number(project.retryAfterMs);
+  const ttl = hint > 0 && Number.isFinite(hint) ? Math.max(5000, Math.min(METADATA_RETRY_MS, hint)) : METADATA_TTL_MS;
+  const row = { ...meta, expires: Date.now() + ttl };
+  boundedSet(metadataCache, key, row);
+  return { row, changed };
+}
 function drainMetadata() {
   if (document.visibilityState !== 'visible' || state.reloadRequired === 'SESSION_EXPIRED') return;
   while (metadataInFlight < 2) {
@@ -240,18 +279,10 @@ function drainMetadata() {
       for (const project of Array.isArray(result.projects) ? result.projects : []) {
         const key = projectKey(project ?? {});
         if (!expected.has(key)) continue;
-        const meta = { name: metaText(project.name), symbol: metaText(project.symbol), image: imageUrl(project.image),
-          description: typeof project.description === 'string' ? project.description.trim().slice(0, 240) : '',
-          initialSupply: catalogInteger(project.initialSupply) };
-        if (!meta.name && !meta.symbol && !meta.image && !meta.description && meta.initialSupply === null) continue;
+        const saved = rememberProjectMetadata(key, project);
+        if (!saved) continue;
         received.add(key);
-        const old = metadataCache.get(key);
-        const merged = { ...meta };
-        for (const field of Object.keys(meta)) if ((meta[field] == null || meta[field] === '') && old?.[field] != null) merged[field] = old[field];
-        const hint = Number(project.retryAfterMs);
-        const ttl = hint > 0 && Number.isFinite(hint) ? Math.max(5000, Math.min(METADATA_RETRY_MS, hint)) : METADATA_TTL_MS;
-        boundedSet(metadataCache, key, { ...merged, expires: Date.now() + ttl });
-        if (!old || Object.keys(meta).some(field => old[field] !== merged[field])) updated.add(key);
+        if (saved.changed) updated.add(key);
       }
       if (updated.size) paintMetadata(updated);
     }).catch(() => { /* Metadata is optional and never blocks project state. */ }).finally(() => {
@@ -333,8 +364,9 @@ function frozen() { return state.running || state.stopping || state.starting || 
 async function api(path, body) {
   const route = path.split('?', 1)[0];
   const sensitive = path === 'start' || path.startsWith('wallets/');
+  const session = state.session;
   const headers = {};
-  if (state.session) headers['X-Corla-Session'] = state.session;
+  if (session) headers['X-Corla-Session'] = session;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   let payload;
   try {
@@ -349,7 +381,7 @@ async function api(path, body) {
     }
   }
   let response;
-  const timeout = path === 'start' || path === 'stop' ? 90_000 : ['state', 'status', 'rpc/status'].includes(route) ? 6_000 :
+  const timeout = path === 'start' || path === 'stop' ? 90_000 : ['state', 'status', 'rpc/status', 'local/lifecycle'].includes(route) ? 6_000 :
     path === 'catalog/quote-assets' ? 25_000 :
     ['catalog', 'catalog/status', 'catalog/funding-times'].includes(path) ? 12_000 :
     ['project/participants', 'project/wallet-balances'].includes(path) ? 8_000 : path === 'project/metadata' ? 15_000 : 35_000;
@@ -363,14 +395,14 @@ async function api(path, body) {
     payload = undefined;
     if (err?.name === 'TimeoutError') throw new Error(path === 'start' || path === 'stop'
       ? '请求超时。请先检查当前运行状态，不要重复启动。' : '读取超时，可稍后重试。');
-    throw new Error('无法连接本地服务，请确认启动窗口仍在运行。');
+    throw new Error('本地服务未连接。Windows 可双击 Start-Corla-UI.wsf 打开。');
   }
   let data;
   try { data = await response.json(); } catch { throw new Error('本地服务返回了不可识别的响应。'); }
   if (!response.ok) {
     const code = typeof data?.code === 'string' ? data.code : '';
-    const reason = response.status === 409 && code === 'CONFIG_STALE' || response.status === 403 && code === 'SESSION_EXPIRED'
-      ? requirePageReload(code) : '';
+    const needsReload = response.status === 409 && code === 'CONFIG_STALE' || response.status === 403 && code === 'SESSION_EXPIRED';
+    const reason = needsReload && session === state.session ? requirePageReload(code) : '';
     const error = new Error(reason || (typeof data?.error === 'string' ? data.error : '操作失败（HTTP ' + response.status + '）'));
     error.status = response.status;
     error.code = code;
@@ -391,8 +423,119 @@ function setNotice(id, text) {
   $(id).hidden = !text;
 }
 function setConnection(ok, text) {
+  localService.connected = ok;
   $('connection-dot').className = 'dot ' + (ok ? 'ready' : 'error');
   $('connection-label').textContent = text;
+  renderLocalService();
+}
+function serviceActionAvailable() {
+  return localService.connected && localService.supported && !localService.phase && !!state.session &&
+    !state.busy && state.reloadRequired !== 'SESSION_EXPIRED';
+}
+function renderLocalService() {
+  const workspace = state.workspace === 'snipe' ? '狙击' : state.workspace === 'mint' ? 'Mint' : '';
+  const phase = localService.phase;
+  const [label, tone] = phase === 'restarting' ? ['重启中', 'stopping'] :
+    phase === 'exiting' ? ['退出中', 'stopping'] :
+    phase === 'restart-pending' ? ['重启待确认', 'stopping'] :
+    phase === 'exit-pending' ? ['退出待确认', 'stopping'] :
+    phase === 'exited' ? ['已退出', ''] :
+    state.reloadRequired === 'SESSION_EXPIRED' ? ['需重新连接', 'stopping'] :
+    localService.connected === null ? ['连接中', ''] :
+    !localService.connected ? ['未连接', 'error'] :
+    state.stopping || state.busy === 'stop' ? ['任务停止中', 'stopping'] :
+    state.starting || state.busy === 'start' ? ['任务启动中', 'stopping'] :
+    state.running ? [(workspace ? workspace + ' ' : '') + (state.mode === 'live' ? '实盘中' : '运行中'), state.mode === 'live' ? 'live' : 'ready'] :
+    ['待机', 'ready'];
+  const status = $('local-service-status'), dot = $('local-service-dot');
+  if (status.textContent !== label) status.textContent = label;
+  dot.className = 'dot' + (tone ? ' ' + tone : '');
+  const available = serviceActionAvailable();
+  for (const action of ['restart', 'exit']) {
+    const button = $('local-service-' + action);
+    button.disabled = !available;
+    button.title = !localService.supported && state.session
+      ? '请先使用新版启动器重新打开 Corla Desk。' : action === 'restart' ? '重启本地服务' : '退出本地服务';
+  }
+}
+function reviewLocalService(action) {
+  if (!serviceActionAvailable()) return;
+  const restart = action === 'restart';
+  const dialog = $('local-service-dialog');
+  dialog.dataset.action = action;
+  $('local-service-title').textContent = restart ? '重启本地服务？' : '退出 Corla Desk？';
+  $('local-service-copy').textContent = '服务会先停止运行中的任务并保存运行记录，已提交的交易仍可能上链。' +
+    (restart ? '重启后本页会自动重新连接，未保存的编辑会丢失，实盘保持待机。' :
+      '退出后页面会保留状态提示，再打开请双击启动器。');
+  $('local-service-confirm').textContent = restart ? '确认重启' : '确认退出';
+  dialog.showModal();
+}
+async function readLocalHealth() {
+  try {
+    const res = await fetch('/api/health', { cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(2000) });
+    const row = res.ok && await res.json();
+    return row?.service === 'corla-desk' && /^[a-f0-9]{16}$/.test(row.instance) ? row : undefined;
+  } catch (error) {
+    // A slow response or malformed JSON is not evidence that the port closed.
+    return error instanceof TypeError ? null : undefined;
+  }
+}
+async function watchLocalLifecycle(action) {
+  const restart = action === 'restart';
+  const deadline = Date.now() + 90_000;
+  let disconnected = 0;
+  while (Date.now() < deadline) {
+    const health = await readLocalHealth();
+    const newInstance = health && health.instance !== localService.instance;
+    if (restart && newInstance && health.action === null) {
+      location.reload();
+      return;
+    }
+    disconnected = health === null ? disconnected + 1 : 0;
+    if (!restart && (disconnected >= 2 || newInstance)) {
+      localService.phase = 'exited';
+      applyRunState({ mode: 'idle' });
+      setConnection(false, '本地服务已退出');
+      renderControls();
+      setNotice('local-service-notice', 'Corla Desk 已退出。需要再打开时，双击 Start-Corla-UI.wsf。');
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 600));
+  }
+  localService.phase = restart ? 'restart-pending' : 'exit-pending';
+  setConnection(false, '等待本地服务');
+  setNotice('local-service-notice', restart ?
+    '尚未连上重启后的服务。请查看项目目录的 state/ui-start.log，或使用启动器重新打开。' :
+    '尚未确认服务已退出。请重新加载页面查看最新状态。');
+  $('reload-local-ui').hidden = false;
+}
+async function submitLocalService(event) {
+  event.preventDefault();
+  const dialog = $('local-service-dialog');
+  const action = dialog.dataset.action;
+  if (!dialog.open || !['restart', 'exit'].includes(action) || !serviceActionAvailable()) return;
+  dialog.close();
+  localService.phase = action === 'restart' ? 'restarting' : 'exiting';
+  setNotice('local-service-notice', '正在停止任务并保存本地运行记录…');
+  setBusy('service');
+  try {
+    const accepted = await api('local/lifecycle', { action });
+    if (accepted?.action !== action) throw new Error('本地服务未确认该操作。');
+  } catch (error) {
+    localService.phase = '';
+    setNotice('local-service-notice', '');
+    setBusy();
+    notify(error.message, true);
+    void updateState();
+    return;
+  }
+  state.session = '';
+  clearTimeout(statePollTimer);
+  syncNotificationStream();
+  resumeSnipeProgress();
+  resumeCatalogAuto();
+  resumeRpcStatus();
+  await watchLocalLifecycle(action);
 }
 function readNotificationPrefs() {
   let stored;
@@ -414,7 +557,8 @@ function renderNotificationControls() {
   const authorize = $('notifications-permission');
   authorize.hidden = !notificationPrefs.enabled || permission !== 'default' || !supported;
   authorize.disabled = notificationPrompt;
-  $('notifications-test').disabled = permission !== 'granted' || !supported;
+  // A manual test may be retried even after a live delivery threw.
+  $('notifications-test-kind').disabled = $('notifications-test').disabled = permission !== 'granted';
   let title = '已关闭', tone = '', detail = '';
   if (!supported) {
     [title, tone, detail] = ['设备不支持', 'amber', '当前环境不能显示网页桌面通知，请使用桌面 Chrome。'];
@@ -546,9 +690,77 @@ function openNotificationProject(token) {
   syncCatalogSearch();
   renderDiscover();
 }
-function createDesktopNotification(title, body, { tag, token } = {}) {
+function notificationImageUrl(value) {
+  return typeof value === 'string' && value.length <= 320 && NOTIFICATION_IMAGE.test(value) ? value : '';
+}
+async function notificationProjectMetadata(event) {
+  const key = projectKey(event), cached = metadataCache.get(key);
+  if (notificationImageUrl(cached?.image) || cached?.expires > Date.now() || !state.session ||
+      state.reloadRequired === 'SESSION_EXPIRED') return cached;
+  let job = notificationMetadataJobs.get(key);
+  if (!job) {
+    if (notificationMetadataJobs.size >= 4) return cached;
+    // Only request the Corla registry entry for this exact mint/token pair.
+    const query = new URLSearchParams({ mint: event.mint, factory: TOKEN_FACTORY, catalogVersion: '4', lang: 'zh' });
+    const url = 'https://flap.sh/apps/corla/mint/' + event.token + '?' + query;
+    job = api('project/metadata', { urls: [url] }).then(result => {
+      const project = Array.isArray(result?.projects) && result.projects.find(row => projectKey(row ?? {}) === key);
+      return project ? rememberProjectMetadata(key, project)?.row : undefined;
+    }).catch(() => undefined).finally(() => notificationMetadataJobs.delete(key));
+    notificationMetadataJobs.set(key, job);
+  }
+  let timer;
   try {
-    const message = new window.Notification(title, { body, lang: 'zh-CN', ...(tag ? { tag } : {}) });
+    // Leave a late lookup in the shared metadata cache for future notices,
+    // but never wait on it for this reminder.
+    return await Promise.race([job, new Promise(resolve => { timer = setTimeout(resolve, NOTIFICATION_METADATA_MS); })]) ??
+      metadataCache.get(key);
+  } finally { clearTimeout(timer); }
+}
+function prepareNotificationIcon(value) {
+  const url = notificationImageUrl(value);
+  if (!url) return Promise.resolve();
+  const cached = notificationIcons.get(url);
+  if (cached?.until > Date.now()) return Promise.resolve(cached.avatar);
+  if (notificationIconJobs.has(url)) return notificationIconJobs.get(url);
+  if (notificationIconJobs.size >= 4) return Promise.resolve();
+  const job = new Promise(resolve => {
+    const picture = new Image();
+    picture.crossOrigin = 'anonymous';
+    picture.referrerPolicy = 'no-referrer';
+    const timer = setTimeout(() => finish(), NOTIFICATION_ICON_MS);
+    function finish(avatar) {
+      clearTimeout(timer);
+      picture.onload = picture.onerror = null;
+      if (!avatar) picture.removeAttribute('src');
+      resolve(avatar);
+    }
+    picture.onerror = () => finish();
+    picture.onload = () => {
+      try {
+        const { naturalWidth: w, naturalHeight: h } = picture;
+        const side = Math.min(w, h);
+        if (!side || w * h > 16_777_216) return finish();
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 96;
+        canvas.getContext('2d').drawImage(picture, (w - side) / 2, (h - side) / 2, side, side, 0, 0, 96, 96);
+        // The native notification now uses a decoded, local thumbnail.
+        // Chrome does not have to fetch the gateway again to show it.
+        const avatar = canvas.toDataURL('image/png');
+        finish(avatar.startsWith('data:image/png;base64,') ? avatar : undefined);
+      } catch { finish(); }
+    };
+    picture.src = url;
+  }).catch(() => undefined).then(avatar => {
+    boundedSet(notificationIcons, url, { avatar, until: Date.now() + (avatar ? METADATA_TTL_MS : 5_000) }, 48);
+    return avatar;
+  }).finally(() => notificationIconJobs.delete(url));
+  notificationIconJobs.set(url, job);
+  return job;
+}
+function createDesktopNotification(title, body, { tag, token, avatar } = {}) {
+  try {
+    const message = new window.Notification(title, { body, lang: 'zh-CN', ...(tag ? { tag } : {}), ...(avatar ? { icon: avatar } : {}) });
     message.onclick = event => {
       event.preventDefault();
       if (token) openNotificationProject(token);
@@ -557,8 +769,6 @@ function createDesktopNotification(title, body, { tag, token } = {}) {
     };
     return message;
   } catch {
-    notificationUnsupported = notificationPermission() === 'granted';
-    syncNotificationStream();
     return null;
   }
 }
@@ -573,13 +783,70 @@ function burstNotificationDetails(event) {
   }
   return '最近 60 秒新增认购已超过项目总批数的 1/3。';
 }
+function showProjectNotification(event, { preview = false, meta = metadataCache.get(projectKey(event)), avatar } = {}) {
+  const name = metaText(meta?.name || event.name || meta?.symbol || event.symbol)
+    .replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, 60) || short(event.token);
+  const title = (preview ? '【测试】' : '') + (event.kind === 'whitelist' ? '白名单 Mint' : '异常 Mint') + ' · ' + name;
+  const detail = event.kind === 'whitelist' ? '检测到新创建的白名单 Mint。' : burstNotificationDetails(event);
+  // An untagged preview is a fresh notification on every click. Live
+  // events still use a stable ID so duplicate delivery can be collapsed.
+  const tag = preview ? undefined : 'corla-desk:' + event.id;
+  return createDesktopNotification(title, detail + '\nCA ' + short(event.token) + ' · 点击在代币看板查看。',
+    { tag, token: event.token, avatar });
+}
+async function sendNotificationPreview() {
+  if (notificationPermission() !== 'granted') return renderNotificationControls();
+  const kind = $('notifications-test-kind').value;
+  if (!Object.hasOwn(NOTIFICATION_PREVIEWS, kind)) return;
+  const sample = NOTIFICATION_PREVIEWS[kind];
+  const attempt = ++notificationTestCount;
+  const status = $('notifications-test-status');
+  const label = '第 ' + attempt + ' 次测试（' + (kind === 'whitelist' ? '白名单 Mint' : '异常 Mint') + '）：';
+  const update = (text, error = false) => {
+    if (attempt !== notificationTestCount) return;
+    status.dataset.error = String(error);
+    status.textContent = label + text;
+  };
+  const failed = () => update('Chrome 未接受显示请求，请检查浏览器通知权限。', true);
+  update('正在准备代币头像…');
+  const avatar = await prepareNotificationIcon(sample.image);
+  if (notificationPageUnloaded) return;
+  const message = notificationPermission() === 'granted' && showProjectNotification(sample, { preview: true, avatar });
+  if (!message) {
+    failed();
+    renderNotificationControls();
+    return;
+  }
+  const previous = activeNotificationPreview;
+  if (attempt === notificationTestCount) {
+    activeNotificationPreview = message;
+    update(avatar ? '已提交给 Chrome。若没看到横幅，请查看系统通知中心。' :
+      '已提交给 Chrome（头像暂未加载）。若没看到横幅，请查看系统通知中心。');
+  }
+  // Retire only the earlier test, never a live reminder. Chrome can ignore
+  // close() before the notification has shown, so also retire late arrivals.
+  message.onshow = () => { if (activeNotificationPreview !== message) message.close(); };
+  message.onclose = () => { if (activeNotificationPreview === message) activeNotificationPreview = undefined; };
+  message.onerror = () => {
+    if (activeNotificationPreview === message) activeNotificationPreview = undefined;
+    if (attempt !== notificationTestCount) return;
+    failed();
+    renderNotificationControls();
+  };
+  if (activeNotificationPreview === message) previous?.close();
+}
 async function deliverChainNotification(event, stream) {
   if (!event || !['whitelist', 'burst'].includes(event.kind) || typeof event.id !== 'string' ||
       !event.id || event.id.length > 256 || typeof event.token !== 'string' || typeof event.mint !== 'string' ||
       !validAddress(event.token) || !validAddress(event.mint)) return;
+  const eligible = () => stream.generation === notificationGeneration && notificationPrefs.enabled && notificationPrefs[event.kind] &&
+    notificationPermission() === 'granted' && !notificationSeen.has(event.id);
+  if (!eligible()) return;
+  const meta = await notificationProjectMetadata(event);
+  if (!eligible()) return;
+  const avatar = await prepareNotificationIcon(meta?.image);
   const showOnce = () => {
-    if (stream.generation !== notificationGeneration || !notificationPrefs.enabled || !notificationPrefs[event.kind] ||
-        notificationPermission() !== 'granted' || notificationSeen.has(event.id)) return;
+    if (!eligible()) return;
     let ids;
     try {
       const stored = localStorage.getItem(NOTIFICATION_PREFS_KEY);
@@ -591,12 +858,11 @@ async function deliverChainNotification(event, stream) {
     } catch { /* optional storage */ }
     if (!Array.isArray(ids)) ids = [];
     if (ids.includes(event.id)) return;
-    const cached = metadataCache.get(projectKey(event));
-    const name = metaText(cached?.name || event.name || cached?.symbol || event.symbol)
-      .replace(/[\p{Cc}\p{Cf}]/gu, '').slice(0, 60) || short(event.token);
-    const title = (event.kind === 'whitelist' ? '白名单 Mint' : '异常 Mint') + ' · ' + name;
-    const detail = event.kind === 'whitelist' ? '检测到新创建的白名单 Mint。' : burstNotificationDetails(event);
-    if (!createDesktopNotification(title, detail + ' 点击在代币看板查看。', { tag: 'corla-desk:' + event.id, token: event.token })) return;
+    if (!showProjectNotification(event, { meta, avatar })) {
+      notificationUnsupported = notificationPermission() === 'granted';
+      syncNotificationStream();
+      return;
+    }
     notificationSeen.add(event.id);
     if (notificationSeen.size > NOTIFICATION_SEEN_LIMIT) notificationSeen.delete(notificationSeen.values().next().value);
     try { localStorage.setItem(NOTIFICATION_SEEN_KEY, JSON.stringify([...ids.slice(1 - NOTIFICATION_SEEN_LIMIT), event.id])); }
@@ -627,12 +893,7 @@ function bindDesktopNotifications() {
     });
   }
   $('notifications-permission').addEventListener('click', requestDesktopNotificationPermission);
-  $('notifications-test').addEventListener('click', () => {
-    if (notificationPermission() !== 'granted') return;
-    const message = createDesktopNotification('Corla Desk · 通知测试', '这是一条测试通知，没有发送任何交易。', { tag: 'corla-desk:test' });
-    if (!message) notify('当前设备无法显示桌面通知。', true);
-    else message.onerror = () => notify('浏览器无法显示桌面通知，请检查 Chrome 和系统设置。', true);
-  });
+  $('notifications-test').addEventListener('click', sendNotificationPreview);
   $('catalog-notification-link').addEventListener('click', event => {
     if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     requestAnimationFrame(() => {
@@ -1229,6 +1490,7 @@ function renderWorkspaceControls(workspace) {
 }
 function renderControls() {
   const disabled = !state.config;
+  renderLocalService();
   renderWorkspaceControls('mint');
   renderWorkspaceControls('snipe');
   const cancel = $('live-cancel-startup');
@@ -1996,7 +2258,7 @@ async function saveConfig(config) {
 let polling = false, statePollTimer;
 function scheduleStatePoll() {
   clearTimeout(statePollTimer);
-  if (!state.session || state.reloadRequired === 'SESSION_EXPIRED') return;
+  if (!state.session || localService.phase || state.reloadRequired === 'SESSION_EXPIRED') return;
   const active = state.running || state.starting || state.stopping || state.busy === 'start' || state.busy === 'stop';
   const visible = document.visibilityState === 'visible';
   const delay = visible ? (active ? 1400 : 3500) : (active ? 10_000 : 30_000);
@@ -2030,7 +2292,7 @@ function applyRunState(data, fallbackWorkspace = 'mint') {
   if (typeof data.snipeReport === 'string' && /^reports\/snipe-runs\/snipe-[\w-]+\.ndjson$/.test(data.snipeReport)) state.snipeReport = data.snipeReport;
 }
 async function updateState() {
-  if (polling || !state.session || state.reloadRequired === 'SESSION_EXPIRED') return;
+  if (polling || !state.session || localService.phase || state.reloadRequired === 'SESSION_EXPIRED') return;
   clearTimeout(statePollTimer);
   polling = true;
   const epoch = configEpoch;
@@ -2040,7 +2302,7 @@ async function updateState() {
     if (state.stateRevision) query.set('since', state.stateRevision);
     if (state.logCursor) query.set('afterLog', state.logCursor);
     const d = await api('state' + (query.size ? '?' + query : ''));
-    if (state.reloadRequired === 'SESSION_EXPIRED') return;
+    if (!state.session || localService.phase || state.reloadRequired === 'SESSION_EXPIRED') return;
     setConnection(true, state.reloadRequired === 'CONFIG_STALE' ? '配置已在其他页面修改' : '本地已连接');
     if (currentView !== 'discover') retryVisibleMetadata();
     if (d.unchanged) return;
@@ -2069,7 +2331,7 @@ async function updateState() {
     }
     renderControls();
   } catch {
-    if (state.reloadRequired !== 'SESSION_EXPIRED') setConnection(false, '连接中断');
+    if (!localService.phase && state.reloadRequired !== 'SESSION_EXPIRED') setConnection(false, '连接中断');
   } finally {
     polling = false;
     scheduleStatePoll();
@@ -3094,6 +3356,9 @@ $('live-password').addEventListener('keydown', event => {
 $('live-form').addEventListener('submit', startLive);
 $('live-cancel-startup').addEventListener('click', cancelLiveStartup);
 $('reload-local-ui').addEventListener('click', () => location.reload());
+$('local-service-restart').addEventListener('click', () => reviewLocalService('restart'));
+$('local-service-exit').addEventListener('click', () => reviewLocalService('exit'));
+$('local-service-form').addEventListener('submit', submitLocalService);
 $('log-filter').addEventListener('change', renderLogs);
 $('snipe-log-filter').addEventListener('change', renderLogs);
 $('import-wallet').addEventListener('click', openWalletImport);
@@ -3184,6 +3449,8 @@ async function boot() {
     state.snipeTiming = data.snipeTiming;
     state.source = data.source;
     state.session = data.sessionToken;
+    localService.instance = data.serviceInstance ?? '';
+    localService.supported = data.serviceControls === true && /^[a-f0-9]{16}$/.test(localService.instance);
     syncNotificationStream();
     state.configRevision = data.configRevision ?? '';
     state.allowLive = Boolean(data.allowLive);

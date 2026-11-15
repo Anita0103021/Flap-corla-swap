@@ -173,6 +173,7 @@ async function fixture(t, { chainId = 56n, localWallets = false, localConfig, be
   };
   return {
     rootDir, url, bootstrap, head, observed, services,
+    close: () => ui.close(),
     get(path) { return fetch(url + path, { headers }); },
     async post(path, body, extra = {}) {
       const merged = new Headers(headers);
@@ -441,6 +442,82 @@ test('UI discover uses a bounded recent block window and does not enable trading
   assert.equal(projects[0].url, config.targets[0].url);
   assert.equal(f.observed.executors.length, 0);
   assert.equal(existsSync(join(f.rootDir, 'config.local.json')), false);
+});
+
+test('service control requires a local session and an exact fixed action', async t => {
+  const accepted = [];
+  const f = await fixture(t, { allowLive: false, onLifecycle: action => { accepted.push(action); } });
+  const route = '/api/local/lifecycle', payload = { action: 'restart' };
+  const health = await ok(await f.get('/api/health'));
+  assert.deepEqual(health, { service: 'corla-desk', instance: f.bootstrap.serviceInstance, action: null });
+  assert.match(health.instance, /^[a-f0-9]{16}$/);
+  assert.equal(f.bootstrap.serviceControls, true);
+  assert.equal((await f.get(route)).status, 404);
+  assert.equal((await f.post(route, payload, { 'X-Corla-Session': null })).status, 403);
+  assert.equal((await f.post(route, payload, { Origin: null })).status, 403);
+  assert.equal((await f.post(route, payload, { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
+  for (const body of [{}, { action: 'run' }, { ...payload, path: 'fixture.mjs' }]) {
+    assert.equal((await f.post(route, body)).status, 400);
+  }
+  assert.deepEqual(accepted, []);
+  const response = await f.post(route, payload);
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), payload);
+  assert.deepEqual(accepted, ['restart']);
+  assert.equal((await ok(await f.get('/api/health'))).action, 'restart');
+  assert.equal((await f.post(route, { action: 'exit' })).status, 409);
+  assert.equal((await f.post('/api/config', { config: f.bootstrap.config })).status, 409);
+  assert.deepEqual(accepted, ['restart']);
+});
+
+test('service exit awaits an active job stopping before taking down the health listener', async t => {
+  const network = Promise.withResolvers(), shutdown = Promise.withResolvers();
+  const f = await fixture(t, {
+    allowLive: false, allowSimulation: true, beforeNetwork: () => network.promise,
+    onLifecycle: action => {
+      assert.equal(action, 'exit');
+      const task = f.close();
+      shutdown.resolve(task);
+      return task;
+    },
+  });
+  const start = f.post('/api/start', { mode: 'simulation', config: f.bootstrap.config });
+  try {
+    await eventually(async () => (await ok(await f.get('/api/state'))).starting);
+    assert.equal((await f.post('/api/local/lifecycle', { action: 'exit' })).status, 202);
+    await eventually(async () => (await ok(await f.get('/api/state'))).stopping);
+    assert.equal((await ok(await f.get('/api/health'))).action, 'exit');
+  } finally { network.resolve(); }
+  assert.equal((await start).status, 400);
+  await shutdown.promise;
+  assert.equal(f.observed.executors.length, 0);
+  assert.equal(f.observed.destroyed, 1);
+  await assert.rejects(f.get('/api/health'));
+});
+
+test('service control is unavailable in embedded servers without a process owner', async t => {
+  const f = await fixture(t);
+  assert.equal(f.bootstrap.serviceControls, false);
+  assert.equal((await f.post('/api/local/lifecycle', { action: 'exit' })).status, 409);
+  assert.equal((await ok(await f.get('/api/health'))).action, null);
+});
+
+test('service exit waits for a wallet save to finish before accepting shutdown', async t => {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const accepted = [];
+  const f = await fixture(t, {
+    onLifecycle: action => { accepted.push(action); },
+    beforeWalletImport: () => { entered.resolve(); return release.promise; },
+  });
+  const saving = f.post('/api/wallets/import', { password: mockPassword, privateKeys: [mockKeyOne] });
+  try {
+    await Promise.race([entered.promise, saving.then(res => assert.fail('wallet write finished before its gate: ' + res.status))]);
+    assert.equal((await f.post('/api/local/lifecycle', { action: 'exit' })).status, 409);
+    assert.deepEqual(accepted, []);
+  } finally { release.resolve(); }
+  assert.equal((await saving).status, 200);
+  assert.equal((await f.post('/api/local/lifecycle', { action: 'exit' })).status, 202);
+  assert.deepEqual(accepted, ['exit']);
 });
 
 test('UI simulation emits project and action updates, blocks another start, and stops cleanly', async t => {

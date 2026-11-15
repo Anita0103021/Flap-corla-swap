@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<job id="corla">
+  <script language="JScript"><![CDATA[
+    var shell = new ActiveXObject("WScript.Shell");
+    var fs = new ActiveXObject("Scripting.FileSystemObject");
+    shell.CurrentDirectory = fs.GetParentFolderName(WScript.ScriptFullName);
+    var cmd = shell.ExpandEnvironmentStrings("%SystemRoot%\\System32\\cmd.exe");
+    var code = shell.Run('"' + cmd + '" /d /c Start-Corla-UI.cmd --background', 0, true);
+    if (code !== 0) {
+      shell.Popup("Corla Desk 启动失败。请确认已安装 Node.js 24 或更新版本，"
+        + "并查看项目文件夹里的 state\\ui-start.log。若旧版已打开，请先关闭旧版服务。", 0, "Corla Desk", 48);
+    }
+    WScript.Quit(code);
+  ]]></script>
+</job>
