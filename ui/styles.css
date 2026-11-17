@@ -155,6 +155,15 @@ h2 { font-size: 18px; letter-spacing: -.017em; line-height: 1.35; font-weight: 6
 .mode-display { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
 .mode-display strong { font-size: 19px; letter-spacing: -.02em; }
 .monitor-inner > p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.snipe-pending-health { margin-top: 12px; padding: 10px 11px; border-radius: 9px; border: 1px solid var(--border); background: var(--inset); }
+.snipe-pending-heading { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 5px 10px; }
+.snipe-pending-heading strong { font-size: 13px; }
+.snipe-pending-health .hint { margin: 5px 0 0; }
+.snipe-pending-sources { display: grid; gap: 6px; list-style: none; padding: 0; margin: 8px 0 0; }
+.snipe-pending-sources:empty { display: none; }
+.snipe-pending-sources li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; font-size: 12px; }
+.snipe-pending-sources li span:first-child { color: var(--text); font-weight: 600; }
+.snipe-pending-sources li span + span { color: var(--muted); }
 #snipe-report-path { overflow-wrap: anywhere; }
 .stats { display: grid; margin: 15px 0; }
 .stats > div { display: flex; justify-content: space-between; gap: 8px; border-top: 1px solid var(--border); padding: 9px 0; font-size: 13px; }
@@ -167,6 +176,7 @@ input::placeholder, textarea::placeholder { color: var(--placeholder); }
 .compact-select { font-size: 13px; padding: 5px 8px; min-height: 37px; }
 .logs-list { max-height: 320px; min-height: 95px; overflow: auto; }
 .log-row { display: grid; grid-template-columns: 78px 106px minmax(0,1fr); gap: 12px; align-items: start; padding: 10px var(--panel-pad); min-height: 42px; }
+:where(#snipe-logs) .log-row { grid-template-columns: 94px 106px minmax(0,1fr); }
 .log-row + .log-row { border-top: 1px solid var(--border); }
 .log-time { color: var(--subtle); font: 12px/1.8 var(--mono); }
 .log-row .badge { justify-self: start; }

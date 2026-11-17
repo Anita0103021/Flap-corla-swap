@@ -10,7 +10,7 @@ import { DIRECT_LAUNCH_PORTAL } from '../src/events.mjs';
 import { makeExecutor } from '../src/execution.mjs';
 import { PANCAKE_FACTORY, ROUTER, ROUTER_ABI, WBNB, v2Output } from '../src/market.mjs';
 import { QUOTE_ERC20 } from '../src/quote-assets.mjs';
-import { buildPreopenBuyPlan, isVerifiedPreopenBuyPlan } from '../src/snipe-preopen.mjs';
+import { buildPreopenBuyPlan, isVerifiedPreopenBuyPlan, preparePreopenMintSequence } from '../src/snipe-preopen.mjs';
 
 const target = { factory: FACTORY, mint: '0x0000000000000000000000000000000000000033', token: '0x0000000000000000000000000000000000000044' };
 const pool = '0x0000000000000000000000000000000000000055';
@@ -44,7 +44,9 @@ const event = (abi, name, address, args) => ({ address, ...abi.encodeEventLog(ab
 
 async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader = false, badSeed = false,
   failedBuy = false, badTokenCode = false, fakeMinterNonce = false, omittedSwap = false,
-  quoteToken = ZeroAddress, shortAllowance = false, differentQuote } = {}) {
+  quoteToken = ZeroAddress, shortAllowance = false, differentQuote, mintCount = 1, totalLots = 100n,
+  nonceGap = false, badProgress = false, senderBalance = parseEther('1'), senderAllowance,
+  distinctSenders = false, legacy = false } = {}) {
   const signer = Wallet.createRandom();
   const pricePerLot = parseEther('0.05');
   const tokenQuote = quoteToken !== ZeroAddress;
@@ -55,18 +57,28 @@ async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader 
   const asset = tokenQuote ? quoteToken : WBNB;
   const value = tokenQuote ? 0n : pricePerLot;
   const input = tokenQuote ? CORLA_QUOTE_ABI.encodeFunctionData('mintQuote', [deploymentKey, []]) : CORLA_ABI.encodeFunctionData('mint', [[]]);
-  const signed = Transaction.from(await signer.signTransaction({ type: 2, chainId: 56, nonce: 5, to,
-    data: input, value, gasLimit: 9_000_000, maxFeePerGas: 80_000_000n, maxPriorityFeePerGas: 80_000_000n }));
-  const pending = { to, from: signer.address, hash: badHash ? '0x' + 'cd'.repeat(32) : signed.hash,
-    chainId: '0x38', type: '0x2', nonce: '0x5', gas: toQuantity(signed.gasLimit), value: toQuantity(value), input,
-    maxFeePerGas: toQuantity(signed.maxFeePerGas), maxPriorityFeePerGas: toQuantity(signed.maxPriorityFeePerGas),
-    r: signed.signature.r, s: signed.signature.s, v: toQuantity(signed.signature.yParity), accessList: [], blockNumber: null };
+  const rows = await Promise.all(Array.from({ length: mintCount }, async (_, i) => {
+    const sender = distinctSenders && i ? Wallet.createRandom() : signer;
+    const nonce = 5 + i + (i && nonceGap ? 1 : 0);
+    const fee = legacy ? { type: 0, gasPrice: 80_000_000n } :
+      { type: 2, maxFeePerGas: 80_000_000n, maxPriorityFeePerGas: 80_000_000n };
+    const signed = Transaction.from(await sender.signTransaction({ ...fee, chainId: 56, nonce, to,
+      data: input, value, gasLimit: 9_000_000 }));
+    return { to, from: sender.address, hash: badHash ? '0x' + 'cd'.repeat(32) : signed.hash,
+      type: toQuantity(fee.type), nonce: toQuantity(nonce), gas: toQuantity(signed.gasLimit), value: toQuantity(value), input,
+      ...(legacy ? { gasPrice: toQuantity(signed.gasPrice) } : {
+        chainId: '0x38', maxFeePerGas: toQuantity(signed.maxFeePerGas), maxPriorityFeePerGas: toQuantity(signed.maxPriorityFeePerGas), accessList: [],
+      }),
+      r: signed.signature.r, s: signed.signature.s, v: toQuantity(legacy ? signed.signature.networkV : signed.signature.yParity),
+      blockNumber: null };
+  }));
+  const pending = rows[0];
   const state = { blockNumber: head.number, phase: 1, launched: false, emergencyWithdrawn: false, quoteToken, quoteDecimals: 6, deploymentKey,
-    token: ZeroAddress, pool: ZeroAddress, fundingDeadline: 90_000n, pricePerLot, mintedLots: 99n, totalLots: 100n, ...patchState };
+    token: ZeroAddress, pool: ZeroAddress, fundingDeadline: 90_000n, pricePerLot, mintedLots: totalLots - BigInt(mintCount), totalLots, ...patchState };
   const success = (returnData = '0x', logs = [], gasUsed = '0x5208') => ({ status: '0x1', returnData, logs, gasUsed });
   const minted = () => success('0x', [
-    event(CORLA_ABI, 'Minted', target.mint, [signer.address, 100]),
-    event(CORLA_ABI, 'Launched', target.mint, [target.token, pool, signer.address]),
+    event(CORLA_ABI, 'Minted', target.mint, [rows.at(-1).from, totalLots]),
+    event(CORLA_ABI, 'Launched', target.mint, [target.token, pool, rows.at(-1).from]),
     event(portal, 'FlapDirectLaunched', DIRECT_LAUNCH_PORTAL, [target.token, 0, target.mint, id('DirectLaunchV2(DirectLaunchV2Data)'), portalData(differentQuote ?? quoteToken)]),
     event(factory, 'PairCreated', PANCAKE_FACTORY, [target.token, asset, pool, 1]),
     event(pair, 'Mint', pool, [DIRECT_LAUNCH_PORTAL, reserveToken, reserveBnb]),
@@ -79,19 +91,21 @@ async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader 
       const { name, args } = QUOTE_ERC20.parseTransaction({ data });
       assert.ok(name === 'balanceOf' || name === 'allowance');
       if (name === 'allowance') assert.equal(args[1], args[0] === wallet ? ROUTER : FACTORY);
-      return QUOTE_ERC20.encodeFunctionResult(name, [name === 'allowance' && shortAllowance ? 0n : parseEther('100')]);
+      return QUOTE_ERC20.encodeFunctionResult(name, [name !== 'allowance' ? parseEther('100') :
+        shortAllowance ? 0n : args[0] !== wallet && senderAllowance !== undefined ? senderAllowance : parseEther('100')]);
     },
     getCode: async (address, block) => {
       assert.equal(address, target.token); assert.equal(block, head.number);
       return badTokenCode ? '0x01' : '0x';
     },
     getTransactionCount: async (address, block) => {
-      assert.equal(address, signer.address); assert.equal(block, head.number);
-      return fakeMinterNonce ? 6 : 5;
+      const first = rows.find(r => r.from === address);
+      assert.ok(first); assert.equal(block, head.number);
+      return fakeMinterNonce ? 6 : Number(first.nonce);
     },
     getBalance: async (address, block) => {
-      assert.equal(address, signer.address); assert.equal(block, head.number);
-      return parseEther('1');
+      assert.ok(rows.some(r => r.from === address)); assert.equal(block, head.number);
+      return senderBalance;
     },
     getBlock: async block => {
       assert.equal(block, head.number);
@@ -108,11 +122,15 @@ async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader 
       assert.equal(request.calls[0].gas, pending.gas);
       assert.equal(request.calls[0].data, input);
       assert.equal(request.calls[0].value, pending.value);
+      assert.deepEqual(request.calls.slice(0, mintCount).map(call => [call.from, call.nonce]), rows.map(r => [r.from, r.nonce]));
       api.push(request.calls);
-      const calls = [minted(), success(token.encodeFunctionResult('mainPool', [pool])),
+      const progress = rows.slice(0, -1).map((row, i) => success('0x', [
+        event(CORLA_ABI, 'Minted', target.mint, [row.from, state.mintedLots + BigInt(badProgress ? 2 : i + 1)]),
+      ]));
+      const calls = [...progress, minted(), success(token.encodeFunctionResult('mainPool', [pool])),
         success(token.encodeFunctionResult('buyTaxRate', [tax])), success(token.encodeFunctionResult('sellTaxRate', [300])),
         success(factory.encodeFunctionResult('getPair', [pool])), success(router.encodeFunctionResult('getAmountsOut', [[settings.amountIn, quoted]]))];
-      if (request.calls.length === 9) {
+      if (request.calls.length === mintCount + 8) {
         const output = failedBuy ? { status: '0x0' } : success('0x', [
           ...(omittedSwap ? [] : [event(pair, 'Swap', pool, [ROUTER, 0, settings.amountIn, quoted, 0, wallet])]),
           event(token, 'Transfer', target.token, [pool, wallet, quoted * 9700n / 10_000n]),
@@ -122,10 +140,14 @@ async function fixture({ patchState = {}, tax = 300, badHash = false, badHeader 
       return [{ parentHash: head.hash, number: toQuantity(head.number + 1), timestamp: toQuantity(head.timestamp + 1), calls }];
     },
   };
-  return { api, pending, armed, run: () => buildPreopenBuyPlan(provider, armed, pending, wallet, trade, head,
-    { services: { inspectMint: async (_provider, checked, block) => {
-      assert.deepEqual(checked, armed); assert.equal(block, head.number); return state;
-    } } }) };
+  let inspections = 0;
+  const options = { services: { inspectMint: async (_provider, checked, block) => {
+    inspections++;
+    assert.deepEqual(checked, armed); assert.equal(block, head.number); return state;
+  } } };
+  return { api, pending, rows, armed, inspections: () => inspections,
+    prepare: (from = rows) => preparePreopenMintSequence(provider, armed, from, trade, head, options),
+    run: (from = rows) => buildPreopenBuyPlan(provider, armed, from, wallet, trade, head, options) };
 }
 
 test('preopen plan independently verifies exact signed final mint and uses the initial simulated quote for minOut', async () => {
@@ -175,7 +197,7 @@ test('preopen uses the factory Mint and verified ERC-20 purchase and sale paths'
 
 test('preopen refuses non-final, already deployed, mismatched nonce, and forged signed-hash candidates before simulation', async () => {
   for (const [options, reason] of [
-    [{ patchState: { mintedLots: 98n } }, /最后一批/],
+    [{ patchState: { mintedLots: 98n } }, /父块剩余批数/],
     [{ badTokenCode: true }, /预计 Token 已部署/],
     [{ fakeMinterNonce: true }, /nonce/],
     [{ badHash: true }, /签名与交易哈希/],
@@ -184,6 +206,49 @@ test('preopen refuses non-final, already deployed, mismatched nonce, and forged 
     await assert.rejects(run, reason);
     assert.equal(api.length, 0);
   }
+});
+
+test('a mined penultimate Mint that arrives late is classified as stale, not a buy wallet funding error', async () => {
+  const f = await fixture({ fakeMinterNonce: true });
+  await assert.rejects(f.run(), error => error.stage === 'stale_pending' && error.evidence.stalePendingCount === 1);
+  assert.equal(f.api.length, 0);
+});
+
+test('47/50 at the parent works with three verified Mints and only the last call launches', async () => {
+  const f = await fixture({ mintCount: 3, totalLots: 50n, distinctSenders: true, legacy: true });
+  const sequence = await f.prepare();
+  assert.equal(sequence.mintedLots, 47n);
+  assert.equal(sequence.remainingLots, 3n);
+  assert.equal(sequence.pendingMintCount, 3);
+  const plan = await f.run(sequence);
+  assert.deepEqual(plan.pendingHashes, f.rows.map(row => row.hash));
+  assert.equal(plan.pendingHash, f.rows[2].hash);
+  assert.equal(plan.amountOutMin, minimum);
+  assert.deepEqual(f.api.map(calls => calls.length), [8, 11]);
+  assert.equal(f.inspections(), 1, 'validated target/sender snapshot is reused by the wallet simulation');
+  const erc20 = await fixture({ mintCount: 3, totalLots: 50n, quoteToken: '0x' + '88'.repeat(20) });
+  const buy = await erc20.run([...erc20.rows].reverse());
+  assert.deepEqual(buy.pendingHashes, erc20.rows.map(row => row.hash), 'same-sender nonces override WS arrival order');
+  assert.equal(ROUTER_ABI.parseTransaction({ data: buy.tx.data }).name, 'swapExactTokensForTokensSupportingFeeOnTransferTokens');
+});
+
+test('missing, duplicate, gapped or underfunded pending Mints never form a three-lot plan', async () => {
+  const onlyTwo = await fixture({ mintCount: 3, totalLots: 50n });
+  await assert.rejects(onlyTwo.run(onlyTwo.rows.slice(0, 2)), /父块剩余批数/);
+  await assert.rejects(onlyTwo.run([...onlyTwo.rows.slice(0, 2), onlyTwo.rows[0]]), /父块剩余批数/);
+  assert.equal(onlyTwo.api.length, 0);
+  for (const options of [
+    { nonceGap: true },
+    { senderBalance: parseEther('0.12') },
+    { quoteToken: '0x' + '88'.repeat(20), senderAllowance: parseEther('0.12') },
+  ]) {
+    const f = await fixture({ mintCount: 3, totalLots: 50n, ...options });
+    await assert.rejects(f.run(), /nonce|累计余额|授权额度/);
+    assert.equal(f.api.length, 0);
+  }
+  const wrongProgress = await fixture({ mintCount: 3, totalLots: 50n, badProgress: true });
+  await assert.rejects(wrongProgress.run(), /逐批推进/);
+  assert.equal(wrongProgress.api.length, 1, 'stop before building a buy after inconsistent Minted events');
 });
 
 test('preopen fails closed on wrong seed, tax, revert, missing real swap, and reorg', async () => {

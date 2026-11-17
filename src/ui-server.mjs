@@ -16,7 +16,7 @@ import { createWalletVault } from './wallet-vault.mjs';
 import { createLocalWalletUnlock } from './local-wallet-unlock.mjs';
 import { makeFastSnipe, prepareSnipe, snipeWsUrl } from './snipe.mjs';
 import { SNIPE_RACE_WINDOW_MS } from './snipe-race.mjs';
-import { MAX_SNIPE_ATTEMPTS } from './snipe-limits.mjs';
+import { MAX_SNIPE_ATTEMPTS, MAX_PREOPEN_MINTS } from './snipe-limits.mjs';
 import { createSnipeReceiptObserver, createSnipeRunRecorder, findLatestSnipeReport } from './snipe-run-recorder.mjs';
 import { readCatalogQuoteMetadata, readDashboardParticipants, readDashboardProjects, readDashboardWalletBalances } from './dashboard-chain.mjs';
 import { createProjectMetadata } from './project-metadata.mjs';
@@ -34,7 +34,8 @@ import { createFlapQuoteCatalog } from './quote-catalog.mjs';
 const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const privateKeys = ['rpcUrl', 'rpcBackupUrls', 'walletFile', 'journalPath'];
 const rpcLabels = { dashboard: '工作区与代币看板', metadata: '代币元数据', mint: 'Mint 与领币', watch: '开盘监控 · HTTP', snipe: '狙击买入' };
-const snipeTiming = { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS, maxAttempts: MAX_SNIPE_ATTEMPTS };
+const snipeTiming = { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS, maxAttempts: MAX_SNIPE_ATTEMPTS,
+  maxPreopenMints: MAX_PREOPEN_MINTS };
 const MAX_FUNDING_REQUEST = 18;
 const MAX_FUNDING_QUEUE = 54;
 const FUNDING_JOB_SIZE = 12;
@@ -242,6 +243,7 @@ export async function createUiServer({
   const stateRevision = () => stateEpoch + ':' + stateSequence;
   const logCursor = () => stateEpoch + ':' + logSequence;
   const stateChanged = () => { stateSequence++; };
+  const pendingState = () => typeof run?.pendingHealth === 'function' ? { snipePending: run.pendingHealth() } : {};
   function state(afterLog) {
     const tail = typeof afterLog === 'string' && afterLog.startsWith(stateEpoch + ':') ? afterLog.slice(stateEpoch.length + 1) : '';
     const after = /^\d{1,16}$/.test(tail) ? Number(tail) : NaN;
@@ -251,7 +253,7 @@ export async function createUiServer({
       workspace: run?.workspace ?? null, stopping: Boolean(run?.controller.signal.aborted),
       starting: Boolean(run && !run.ready && !run.controller.signal.aborted), logCursor: logCursor(),
       logs: delta ? logs.slice(after - floor) : logs, ...(delta ? { logsDelta: true } : {}),
-      projects: [...projects.values()], lastError, lastErrorWorkspace, snipeReport: lastSnipeReport };
+      projects: [...projects.values()], lastError, lastErrorWorkspace, snipeReport: lastSnipeReport, ...pendingState() };
   }
   function log(event, fields = {}) {
     const row = { time: new Date().toISOString(), event, ...fields };
@@ -904,6 +906,7 @@ export async function createUiServer({
         }
         const fast = prepared ? svc.makeFastSnipe({ provider, watchProvider, settings: cfg.snipe, prepared, cfg, execute, signal, log: jobLog }) : null;
         const tick = fast ? null : svc.makeMonitor({ provider, cfg, wallets, execute, armBlock, signal, log: jobLog });
+        task.pendingHealth = fast?.pendingHealth;
         task.ready = true;
         lastError = undefined;
         lastErrorWorkspace = undefined;
@@ -1048,7 +1051,7 @@ export async function createUiServer({
         }
         const revision = stateRevision();
         return json(res, 200, since === revision && (afterLog === null || afterLog === logCursor())
-          ? { unchanged: true, stateRevision: revision } : state(afterLog));
+          ? { unchanged: true, stateRevision: revision, ...pendingState() } : state(afterLog));
       }
       if (req.method === 'GET' && pathname === '/api/rpc/status') {
         if ((req.headers.origin && req.headers.origin !== origin) ||

@@ -149,6 +149,11 @@
               <div class="monitor-inner">
                 <div class="mode-display"><span id="snipe-mode-indicator" class="dot"></span><strong id="snipe-mode-label">待机</strong></div>
                 <p id="snipe-mode-copy">待机期间不发送交易。</p>
+                <div id="snipe-pending-health" class="snipe-pending-health" hidden>
+                  <div class="snipe-pending-heading"><strong>待打包 WSS</strong><span id="snipe-pending-status" class="badge" role="status">等待读取</span></div>
+                  <p id="snipe-pending-copy" class="hint"></p>
+                  <ul id="snipe-pending-sources" class="snipe-pending-sources" aria-label="待打包节点状态"></ul>
+                </div>
                 <dl class="stats"><div><dt>单钱包买入额</dt><dd id="snipe-amount-label">—</dd></div><div><dt>买入钱包数量</dt><dd id="snipe-wallet-count">—</dd></div><div><dt>BNB 预算上限</dt><dd id="snipe-budget-label">—</dd></div></dl>
                 <small id="snipe-live-caption" class="hint">启动前需核对策略并解锁钱包。</small>
                 <p class="hint" id="snipe-report-row" hidden>最近的运行记录：<code id="snipe-report-path"></code> <button type="button" id="copy-snipe-report" class="btn secondary compact">复制文件路径</button></p>
@@ -171,7 +176,7 @@
                 <p class="hint" id="snipe-slippage-hint">当前报价滑点限制报价到成交之间的偏差，不限制报价已比开盘价涨了多少。</p>
                 <p class="hint" id="snipe-opening-price-hint">开盘价溢价限制补买价格相对开盘基准的上涨幅度。0% 表示不得高于开盘价，不是关闭保护。</p>
                 <p class="hint" id="snipe-concurrency-hint">每轮把同一笔已签名买单同时投给最多这么多健康的狙击 RPC，节点不足时按实际数量投递。</p>
-                <p class="hint" id="snipe-attempts-hint">每项目、每钱包的发单上限。剩 1 批时继续监听末笔 Mint，等待不消耗轮数，也不计入发单时间。上一轮明确未接收或链上回退后才会继续，回退会花 Gas。</p>
+                <p class="hint" id="snipe-attempts-hint">每项目、每钱包的发单上限。最后几批 Mint 可以同块完成；待打包交易齐备并通过顺序模拟后才发单，等待不消耗轮数。上一轮明确未接收或链上回退后才会继续，回退会花 Gas。</p>
                 <div class="snipe-opening-policy">
                   <label class="checkbox-row"><input name="requirePreopen" type="checkbox" checked aria-describedby="snipe-preopen-hint snipe-preopen-error"><span>没抢到开盘就不追<small id="snipe-preopen-hint">至少设为 2 轮。只尝试可核验的开盘前机会；检测到开盘或代币已部署就不再新签。</small></span></label>
                   <p class="hint snipe-preopen-error" id="snipe-preopen-error" role="status" hidden></p>

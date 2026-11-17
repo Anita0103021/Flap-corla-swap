@@ -4,7 +4,8 @@ import { CORLA_ABI, inspectMint, requireCorlaPool } from './corla.mjs';
 import { DIRECT_LAUNCH_PORTAL } from './events.mjs';
 import { applyOpeningPriceGuard, buildBuy, buildSimulatedSell, marketLimits, PANCAKE_FACTORY, ROUTER, v2Output, WBNB } from './market.mjs';
 import { decodePendingMint } from './pending-mint-shadow.mjs';
-import { QUOTE_ERC20, quoteAsset, requireQuoteFunds } from './quote-assets.mjs';
+import { quoteAsset, readQuoteFunds, requireQuoteFunds } from './quote-assets.mjs';
+import { MAX_PREOPEN_CANDIDATES, MAX_PREOPEN_MINTS } from './snipe-limits.mjs';
 
 const PORTAL = new Interface(['event FlapDirectLaunched(address token,uint8 kind,address creator,bytes32 schemaId,bytes data)']);
 const PAIR = new Interface([
@@ -30,6 +31,7 @@ const V2_SCHEMA = id('DirectLaunchV2(DirectLaunchV2Data)');
 const V2_DATA = 'tuple(uint256 nonce,uint256 ts,uint8 tokenVersion,address quoteToken,uint8 migratorType,uint256 initialPriceWad,string name,string symbol,string meta,address pool,uint256 totalSupply,uint8 antiSniperMode,uint16 maxBuyBps)';
 const coder = AbiCoder.defaultAbiCoder();
 const verifiedPlans = new WeakSet();
+const verifiedSequences = new WeakMap();
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const hash = v => typeof v === 'string' && /^0x[0-9a-f]{64}$/i.test(v);
 const quantity = v => typeof v === 'string' && /^0x[0-9a-f]{1,64}$/i.test(v);
@@ -64,7 +66,8 @@ function signedMint(pending, target, value) {
     const gasPriceCeiling = tx.gasPrice ?? tx.maxFeePerGas;
     if (!same(tx.from, pending.from) || !same(tx.hash, pending.hash) || !gasPriceCeiling ||
         (type === 2 && tx.maxPriorityFeePerGas > gasPriceCeiling)) throw new Error();
-    return { from: tx.from, nonce: Number(nonce), gasPriceCeiling, call: {
+    return { from: tx.from, hash: tx.hash.toLowerCase(), nonce: Number(nonce),
+      cost: value + gasLimit * gasPriceCeiling, call: {
       from: tx.from, to, nonce: toQuantity(nonce), gas: toQuantity(gasLimit), data: tx.data,
       value: toQuantity(value), ...(type ? { accessList } : {}),
       ...Object.fromEntries(Object.entries(prices).map(([key, value]) => [key, toQuantity(value)])),
@@ -131,9 +134,18 @@ async function simulate(provider, head, calls, signal) {
   return block.calls;
 }
 
-/** Read-only conditional plan for an exact visible final Mint. No signing,
- * overrides of real balances, raw submission, or guessed minimum output. */
-export async function buildPreopenBuyPlan(provider, target, pending, wallet, settings, head, { signal, services = {} } = {}) {
+export class PreopenMintWait extends Error {
+  constructor(stage, evidence) {
+    super(stage === 'waiting_lots' ? '父块尚未进入最后三批 Mint' : stage === 'stale_pending' ?
+      '待打包 Mint 的 nonce 已在父块消耗' : '父块剩余批数超过可见的待打包 Mint 数');
+    this.stage = stage;
+    this.evidence = evidence;
+  }
+}
+
+/** Pin the target state once for all selected wallets. As the reads run,
+ * another full transaction can arrive and complete the final sequence. */
+export async function preparePreopenMintSequence(provider, target, pending, settings, head, { signal, services = {} } = {}) {
   signal?.throwIfAborted();
   guard(checkedHead(head), '缺少可核验的末笔 Mint 父块');
   guard(same(target?.factory, FACTORY), '不支持此 Corla 工厂');
@@ -144,35 +156,130 @@ export async function buildPreopenBuyPlan(provider, target, pending, wallet, set
   const verified = { mint: address(target.mint, 'Mint'), token: address(target.token, 'Token'), factory: FACTORY,
     ...(tokenQuote ? { quoteToken, deploymentKey: target.deploymentKey, pricePerLot: target.pricePerLot } : {}) };
   guard(!same(asset, verified.token), '买入币与支付币相同');
-  const recipient = address(typeof wallet === 'string' ? wallet : wallet?.address, '钱包');
-  guard(!same(recipient, pending?.from), 'Mint 钱包不能同时作为提前提交钱包');
-  guard(Number.isSafeInteger(settings?.slippageBps) && settings.slippageBps > 0 && settings.slippageBps <= 1000 &&
-    Number.isSafeInteger(settings.deadlineSeconds) && settings.deadlineSeconds >= 5 && settings.deadlineSeconds <= 60,
-  '提前提交必须有不高于 10% 的滑点上限和有效截止时间');
   const at = head.number;
-  // Cheaply authenticate the pending envelope before touching chain reads.
-  // The amount bound here is verified against the real contract below;
-  // this does not turn an arbitrary value into a valid last Mint.
-  const value = uint(pending?.value);
-  const mint = signedMint(pending, verified, value);
-  const [state, code, nonce, funds] = await Promise.all([
+  const inputs = () => {
+    const rows = typeof pending === 'function' ? pending() : Array.isArray(pending) ? pending : [pending];
+    const unique = new Map();
+    for (const row of rows.slice(-MAX_PREOPEN_CANDIDATES)) {
+      if (hash(row?.hash)) unique.set(row.hash.toLowerCase(), row);
+    }
+    return [...unique.values()];
+  };
+  const envelopes = new Map(), accounts = new Map();
+  const readEnvelope = row => {
+    const id = row.hash.toLowerCase();
+    if (!envelopes.has(id)) {
+      try {
+        const mint = signedMint(row, verified, uint(row.value));
+        envelopes.set(id, { mint });
+        if (!accounts.has(mint.from)) {
+          // Overlap the sender reads with the target inspection, even when
+          // the first visible candidate is the only Mint required.
+          const checks = Promise.all([provider.getTransactionCount(mint.from, at),
+            provider.getBalance(mint.from, at), tokenQuote ? readQuoteFunds(provider, quoteToken, mint.from, FACTORY, at) : null]);
+          accounts.set(mint.from, checks.then(value => ({ value }), error => ({ error })));
+        }
+      } catch (error) { envelopes.set(id, { error }); }
+    }
+    return envelopes.get(id);
+  };
+  const inspection = Promise.all([
     (services.inspectMint ?? inspectMint)(provider, verified, at, undefined, { requireQuoteMint: tokenQuote, verifyPool: true }),
-    provider.getCode(verified.token, at), provider.getTransactionCount(mint.from, at), provider.getBalance(mint.from, at),
-    tokenQuote ? requireQuoteFunds(provider, quoteToken, recipient, ROUTER, settings.amountIn, at) : null,
+    provider.getCode(verified.token, at),
   ]);
+  for (const row of inputs()) readEnvelope(row);
+  const [state, code] = await inspection;
+  signal?.throwIfAborted();
   requireCorlaPool(state);
   guard(state.blockNumber === at && state.phase === 1 && state.launched === false && state.emergencyWithdrawn === false &&
     state.quoteToken === quoteToken && state.token === ZeroAddress && state.pool === ZeroAddress &&
     state.fundingDeadline > BigInt(head.timestamp + 1) && state.pricePerLot > 0n &&
-    (tokenQuote ? value === 0n && state.pricePerLot === target.pricePerLot && state.deploymentKey === target.deploymentKey &&
-      state.quoteDecimals === settings.quoteDecimals : state.pricePerLot === value) &&
-    state.mintedLots + 1n === state.totalLots,
-  '尚不能在核验的父块确认只剩最后一批 Mint');
-  guard(code === '0x' && nonce === mint.nonce && funds >= value + BigInt(mint.call.gas) * mint.gasPriceCeiling,
-    '预计 Token 已部署，或末笔 Mint 发件人余额/nonce 不匹配');
-  if (tokenQuote) await requireQuoteFunds(provider, quoteToken, mint.from, FACTORY, state.pricePerLot, at);
+    (target.pricePerLot === undefined || state.pricePerLot === target.pricePerLot) &&
+    (!tokenQuote || (state.deploymentKey === target.deploymentKey && state.quoteDecimals === settings.quoteDecimals)) &&
+    state.mintedLots < state.totalLots, '父块的 Corla 筹资状态或支付币已变化');
+  guard(code === '0x', '预计 Token 已部署');
+  const needed = state.totalLots - state.mintedLots, value = tokenQuote ? 0n : state.pricePerLot;
+  const rows = inputs();
+  const evidence = { mintedLots: state.mintedLots, totalLots: state.totalLots, quoteBlock: at,
+    remainingLots: needed, pendingCandidateCount: rows.length };
+  if (needed > BigInt(MAX_PREOPEN_MINTS)) throw new PreopenMintWait('waiting_lots', evidence);
+  if (BigInt(rows.length) < needed) throw new PreopenMintWait('waiting_pending', evidence);
+
+  const senders = new Map();
+  let failure, valid = 0;
+  for (const [order, row] of rows.entries()) {
+    const { mint, error } = readEnvelope(row);
+    if (error) { failure ??= error; continue; }
+    if (BigInt(mint.call.value) !== value) continue;
+    const nonces = senders.get(mint.from) ?? new Map();
+    nonces.set(mint.nonce, { ...mint, order }); // latest replacement per sender/nonce
+    senders.set(mint.from, nonces);
+    valid++;
+  }
+  if (BigInt(valid) < needed && failure) throw failure;
+  let stalePendingCount = 0;
+  const eligible = (await Promise.all([...senders].map(async ([sender, nonces]) => {
+    const account = await accounts.get(sender);
+    if (account.error) return [];
+    const [nonce, funds, quoteFunds] = account.value;
+    if (!Number.isSafeInteger(nonce) || nonce < 0 || typeof funds !== 'bigint' || funds < 0n ||
+        (tokenQuote && !quoteFunds)) return [];
+    for (const seenNonce of nonces.keys()) if (seenNonce < nonce) stalePendingCount++;
+    const contiguous = [];
+    let cost = 0n;
+    for (let i = 0; Number.isSafeInteger(nonce + i) && i < Number(needed); i++) {
+      const mint = nonces.get(nonce + i);
+      if (!mint) break;
+      cost += mint.cost;
+      const quoteCost = BigInt(i + 1) * state.pricePerLot;
+      if (funds < cost || (quoteFunds && (quoteFunds.balance < quoteCost || quoteFunds.allowance < quoteCost))) break;
+      contiguous.push(mint);
+    }
+    return contiguous;
+  }))).filter(list => list.length);
+  signal?.throwIfAborted();
+  if (stalePendingCount > 0 && stalePendingCount === [...senders.values()].reduce((n, nonces) => n + nonces.size, 0)) {
+    throw new PreopenMintWait('stale_pending', { ...evidence, stalePendingCount });
+  }
+  // Keep each sender's nonce order even if its WSS frames arrived reversed.
+  // Between different senders use receive order, not a claim about the
+  // validator's ordering. The exact resulting sequence is still simulated.
+  const mints = [];
+  while (mints.length < Number(needed) && eligible.length) {
+    eligible.sort((a, b) => needed === 1n ? b[0].order - a[0].order : a[0].order - b[0].order);
+    mints.push(eligible[0].shift());
+    if (!eligible[0].length) eligible.shift();
+  }
+  guard(BigInt(mints.length) === needed, '待打包 Mint 的 nonce 不连续，或累计余额或授权额度不足');
+  const sequence = Object.freeze({ ...evidence, pendingMintCount: mints.length,
+    pendingHashes: Object.freeze(mints.map(row => row.hash)) });
+  verifiedSequences.set(sequence, { provider, verified, asset, head: { hash: head.hash, timestamp: head.timestamp }, state, mints });
+  return sequence;
+}
+
+/** Read-only conditional plan for the visible final 1–3 Mints. No signing,
+ * overrides of real balances, raw submission, or guessed minimum output. */
+export async function buildPreopenBuyPlan(provider, target, pending, wallet, settings, head, { signal, services = {} } = {}) {
+  signal?.throwIfAborted();
+  const sequence = verifiedSequences.has(pending) ? pending :
+    await preparePreopenMintSequence(provider, target, pending, settings, head, { signal, services });
+  const checked = verifiedSequences.get(sequence);
+  const { verified, asset, state, mints } = checked;
+  const quoteToken = quoteAsset(verified.quoteToken);
+  const tokenQuote = quoteToken !== ZeroAddress;
+  const at = sequence.quoteBlock;
+  guard(checked.provider === provider && same(target.mint, verified.mint) && same(target.token, verified.token) &&
+    same(target.factory, FACTORY) && checkedHead(head) && at === head.number && same(checked.head.hash, head.hash) &&
+    checked.head.timestamp === head.timestamp && quoteToken === quoteAsset(settings.quoteToken) &&
+    (!tokenQuote || settings.quoteDecimals === state.quoteDecimals), '提前买单的父块或支付币已变化');
+  const recipient = address(typeof wallet === 'string' ? wallet : wallet?.address, '钱包');
+  guard(!mints.some(mint => same(recipient, mint.from)), 'Mint 钱包不能同时作为提前提交钱包');
+  guard(Number.isSafeInteger(settings?.slippageBps) && settings.slippageBps > 0 && settings.slippageBps <= 1000 &&
+    Number.isSafeInteger(settings.deadlineSeconds) && settings.deadlineSeconds >= 5 && settings.deadlineSeconds <= 60,
+  '提前提交必须有不高于 10% 的滑点上限和有效截止时间');
 
   const path = [asset, verified.token];
+  const mintCalls = mints.map(row => row.call);
   const getters = [
     [TOKEN, verified.token, 'mainPool', []],
     [TOKEN, verified.token, 'buyTaxRate', []],
@@ -182,9 +289,16 @@ export async function buildPreopenBuyPlan(provider, target, pending, wallet, set
   ];
   const query = getters.map(([abi, to, name, args]) => ({ from: recipient, to, data: abi.encodeFunctionData(name, args) }));
   function verifyOpened(calls) {
-    const seed = launchSeed(calls[0], verified, mint.from, state.totalLots, asset);
+    for (let i = 0; i < mints.length - 1; i++) {
+      const minted = findLogs(calls[i], CORLA_ABI, 'Minted', verified.mint);
+      guard(minted.length === 1 && same(minted[0].wallet, mints[i].from) &&
+        minted[0].mintedLots === state.mintedLots + BigInt(i + 1) &&
+        findLogs(calls[i], CORLA_ABI, 'Launched', verified.mint).length === 0,
+      '连续 Mint 未按父块进度逐批推进');
+    }
+    const seed = launchSeed(calls[mints.length - 1], verified, mints.at(-1).from, state.totalLots, asset);
     const values = getters.map(([abi, , name], i) => {
-      const data = calls[i + 1]?.returnData;
+      const data = calls[i + mints.length]?.returnData;
       const decoded = abi.decodeFunctionResult(name, data);
       guard(same(abi.encodeFunctionResult(name, decoded), data), '预演报价返回不完整');
       return decoded[0];
@@ -194,20 +308,24 @@ export async function buildPreopenBuyPlan(provider, target, pending, wallet, set
       amounts[1] === v2Output(settings.amountIn, seed.reserveQuote, seed.reserveToken), '预演报价与开盘储备不一致');
     return { ...seed, buyTax, sellTax, quoted: amounts[1] };
   }
-  const seed = verifyOpened(await simulate(provider, head, [mint.call, ...query], signal));
+  const [preview] = await Promise.all([
+    simulate(provider, head, [...mintCalls, ...query], signal),
+    tokenQuote ? requireQuoteFunds(provider, quoteToken, recipient, ROUTER, settings.amountIn, at) : null,
+  ]);
+  const seed = verifyOpened(preview);
   const limits = applyOpeningPriceGuard({ ...seed, ...marketLimits({ ...seed, amountIn: settings.amountIn, settings }) },
     seed, seed.buyTax, settings);
   const tx = buildBuy({ path, amountOutMin: limits.amountOutMin }, recipient, settings, head);
   const deadline = head.timestamp + settings.deadlineSeconds;
-  const actual = await simulate(provider, head, [mint.call, ...query,
+  const actual = await simulate(provider, head, [...mintCalls, ...query,
     { from: recipient, to: tx.to, data: tx.data, value: toQuantity(tx.value) },
     { from: recipient, to: verified.token, data: TOKEN.encodeFunctionData('approve', [ROUTER, limits.amountOutMin]) },
     { from: recipient, to: ROUTER, data: buildSimulatedSell(path, limits.amountOutMin, limits.reverseMin, recipient, deadline, quoteToken) },
   ], signal);
   const verifiedSeed = verifyOpened(actual);
   guard(Object.keys(seed).every(key => seed[key] === verifiedSeed[key]), '两次预演的开盘池不一致');
-  const buy = actual[query.length + 1];
-  const sell = actual[query.length + 3];
+  const buy = actual[mints.length + query.length];
+  const sell = actual[mints.length + query.length + 2];
   const buySwap = findLogs(buy, PAIR, 'Swap', seed.pool);
   const sellSwap = findLogs(sell, PAIR, 'Swap', seed.pool);
   const bought = findLogs(buy, TOKEN, 'Transfer', verified.token).filter(row => same(row.from, seed.pool) && same(row.to, recipient))
@@ -225,7 +343,8 @@ export async function buildPreopenBuyPlan(provider, target, pending, wallet, set
     openingNetOut: limits.openingNetOut, quotedNetOut: limits.quotedNetOut,
     openingAmountOutMin: limits.openingAmountOutMin, maxOpeningPremiumBps: limits.maxOpeningPremiumBps,
     reverseMin: limits.reverseMin, recipient, mint: verified.mint, token: verified.token, quoteBlock: at,
-    quoteBlockHash: head.hash, pendingHash: pending.hash.toLowerCase(), pool: seed.pool, deadline, quoteToken });
+    quoteBlockHash: head.hash, pendingHash: sequence.pendingHashes.at(-1), pendingHashes: sequence.pendingHashes,
+    pool: seed.pool, deadline, quoteToken });
   verifiedPlans.add(plan);
   return plan;
 }

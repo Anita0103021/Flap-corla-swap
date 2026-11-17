@@ -160,6 +160,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
   const inclusion = c => lower(c.blockHash) + ':' + lower(c.txHash);
   function onRemoved(candidate) {
     removed.add(inclusion(candidate));
+    race.removeLaunchSignal(candidate);
     if (removed.size > 128) removed.delete(removed.values().next().value);
   }
   async function refreshReceipts() {
@@ -371,9 +372,10 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
     const key = lower(target.mint);
     if (attempted.has(key)) return;
     if (inFlight.has(key)) return false;
-    const seen = performance.now();
+    const arrival = race.noteLaunchSignal(candidate, performance.now());
+    const seen = arrival.seen;
     const quoteTelemetry = {};
-    log('snipe_detected', { mint: target.mint, token: target.token, signalSource: candidate.source,
+    if (arrival.first) log('snipe_detected', { mint: target.mint, token: target.token, signalSource: arrival.source,
       launchBlock: candidate.blockNumber, launchTx: candidate.txHash, pool: candidate.pool, quoteToken: target.quoteToken });
     const task = place(candidate, target, seen, key, quoteTelemetry).catch(e => {
       if (ended()) return;
@@ -388,7 +390,7 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
     return task;
   }
 
-  return async function run() {
+  async function run() {
     const feed = svc.makeLaunchFeed({ provider: watchProvider, targets: prepared.targets, armBlock: prepared.armBlock,
       windowBlocks: settings.windowBlocks, wsUrl: prepared.wsUrl, scanMs: settings.scanMs, signal, onCandidate, onRemoved,
       onStatus: status => { if (!ended()) log('snipe_feed', typeof status === 'string' ? { message: status } : status); } });
@@ -399,8 +401,8 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
       }
     }, 850);
     try {
-      await feed.start();
       race.start();
+      await feed.start();
       // Starting the feed is never gated on reconciling prior reservations.
       seed = seedPending().finally(() => { seed = null; });
       await abortWait(signal);
@@ -410,5 +412,6 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
       try { await Promise.all([feed.close(), race.close()]); }
       finally { await Promise.allSettled([...inFlight.values(), ...warmChecks, receiptCheck, seed].filter(Boolean)); }
     }
-  };
+  }
+  return Object.assign(run, { pendingHealth: race.pendingHealth });
 }

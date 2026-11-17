@@ -5,10 +5,11 @@ import { Interface, ZeroAddress } from 'ethers';
 import { CORLA_LAUNCH_TOPIC } from './events.mjs';
 import { WBNB } from './market.mjs';
 import { quoteAsset } from './quote-assets.mjs';
+import { MAX_PREOPEN_MINTS } from './snipe-limits.mjs';
 
 const EVENTS = new Set([
   'watch_started', 'watch_stopped', 'watch_error', 'project', 'project_error', 'rpc_error', 'journal',
-  'snipe_feed', 'snipe_detected', 'snipe_pending', 'snipe_pending_match', 'snipe_pending_feed',
+  'snipe_feed', 'snipe_detected', 'snipe_pending', 'snipe_pending_match', 'snipe_pending_feed', 'snipe_pending_gate',
   'snipe_race_mode', 'snipe_race_attempt', 'snipe_race_outcome', 'snipe_send', 'snipe_ack',
   'snipe_receipt', 'snipe_launch_index', 'snipe_first_buy', 'buy', 'buy_skipped',
 ]);
@@ -18,8 +19,10 @@ const NUMBERS = [
   'launchBlock', 'seenBlock', 'receiptBlock', 'quoteBlock', 'parentBlock', 'lastBlock', 'launchIndex',
   'receiptIndex', 'transactionIndex', 'scanToBlock', 'scanMs', 'windowBlocks', 'deadlineSeconds',
   'preopenLots', 'slippageBps', 'maxOpeningPremiumBps', 'maxPriceImpactBps', 'maxBuyTaxBps', 'maxSellTaxBps', 'phase',
+  'pendingCandidateCount', 'pendingMintCount', 'pendingSource', 'pendingSourceCount', 'pendingHealthyCount', 'pendingFullSourceCount',
+  'stalePendingCount',
   'fullMessages', 'hashMessages', 'droppedMessages', 'unrecognizedMessages', 'connections',
-  'matchingPendingMessages', 'canonicalLaunches', 'matchesDuringHealthyFullFeed', 'retryMs',
+  'matchingPendingMessages', 'canonicalLaunches', 'matchesDuringHealthyFullFeed', 'retryMs', 'reconnects',
 ];
 const TIMINGS = [
   'leadMs', 'elapsedMs', 'quoteMs', 'proofMs', 'headMs', 'marketMs', 'stateMs', 'openingTaxMs', 'walletPrepMs',
@@ -29,12 +32,12 @@ const TIMINGS = [
 const QUANTITIES = [
   'amountIn', 'amountOutMin', 'quoted', 'openingNetOut', 'quotedNetOut', 'openingAmountOutMin', 'gasEstimate', 'gasUsed', 'gasLimit', 'gasPrice',
   'effectiveGasPrice', 'maxGasPriceWei', 'gasLimitCap', 'maxTotalWei', 'reserveBnb', 'reserveQuote',
-  'minLiquidity', 'pricePerLot', 'mintedLots', 'totalLots', 'batches', 'raceGasCap',
+  'minLiquidity', 'pricePerLot', 'mintedLots', 'totalLots', 'remainingLots', 'batches', 'raceGasCap',
 ];
 const HASHES = ['txHash', 'launchTx', 'launchTxHash', 'pendingTxHash', 'blockHash', 'receiptBlockHash', 'parentHash'];
 const BOOLS = [
   'live', 'launched', 'receiptStable', 'preflightOverlapped', 'knownSuccess', 'matchedPending',
-  'success', 'healthy', 'fullFeedHealthy', 'seenBeforeLocalConfirmation', 'submitted', 'requirePreopen',
+  'success', 'healthy', 'fullFeedHealthy', 'seenBeforeLocalConfirmation', 'afterLaunchSignal', 'submitted', 'requirePreopen',
 ];
 const TRANSPORT = new Set(['ws', 'http', 'pending', 'confirmed']);
 const MODE = new Set(['pending', 'confirmed', 'preopen', 'repeat', 'race', 'once', 'single', 'public', 'live']);
@@ -42,7 +45,7 @@ const FEED = new Set([
   'ready', 'subscribed', 'connecting', 'connected', 'retrying', 'reconnecting', 'error', 'degraded',
   'disconnected', 'disabled', 'polling', 'scanning', 'active', 'busy', 'fallback', 'idle',
   'full', 'mixed', 'hash_only', 'subscribed_no_payload', 'timeout', 'unsupported', 'chain_unverified',
-  'transport_unavailable', 'unavailable', 'stopped',
+  'transport_unavailable', 'unavailable', 'stopped', 'payload_timeout', 'invalid_config',
 ]);
 const STATUS = new Set([
   'confirmed', 'failed', 'pending', 'skipped', 'simulated', 'submitted', 'not_submitted', 'mined',
@@ -134,8 +137,8 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
   if (allowedTokens.has(low(fields.token))) result.token = low(fields.token);
   if (isAddress(fields.quoteToken) && allowedTokens.has(low(fields.token))) result.quoteToken = low(fields.quoteToken);
   for (const key of NUMBERS) if (int(fields[key])) result[key] = fields[key];
-  if (int(fields.pendingReceivedAtMs) && fields.pendingReceivedAtMs <= 8_640_000_000_000_000) {
-    result.pendingReceivedAtMs = fields.pendingReceivedAtMs;
+  for (const key of ['pendingReceivedAtMs', 'pendingLastFullAtMs']) {
+    if (int(fields[key]) && fields[key] <= 8_640_000_000_000_000) result[key] = fields[key];
   }
   if (Number.isSafeInteger(fields.blockOffset)) result.blockOffset = fields.blockOffset;
   for (const key of TIMINGS) {
@@ -149,6 +152,10 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
     if (encoded !== undefined) result[key] = encoded;
   }
   for (const key of HASHES) if (isHash(fields[key])) result[key] = low(fields[key]);
+  if (Array.isArray(fields.pendingHashes) && fields.pendingHashes.length > 0 &&
+      fields.pendingHashes.length <= MAX_PREOPEN_MINTS && fields.pendingHashes.every(isHash)) {
+    result.pendingHashes = fields.pendingHashes.map(low);
+  }
   for (const key of BOOLS) if (typeof fields[key] === 'boolean') result[key] = fields[key];
   for (const key of ['source', 'signalSource', 'confirmedSource', 'transport']) {
     if (TRANSPORT.has(fields[key])) result[key] = fields[key];
@@ -156,6 +163,7 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
   for (const key of ['raceMode', 'mode']) if (MODE.has(fields[key])) result[key] = fields[key];
   for (const key of ['pendingMode', 'phase', 'feedMode', 'mode']) if (FEED.has(fields[key])) result[key] = fields[key];
   if (STATUS.has(fields.status)) result.status = fields.status;
+  if (['waiting_lots', 'waiting_pending', 'stale_pending', 'ready'].includes(fields.preopenStage)) result.preopenStage = fields.preopenStage;
   if (['aggregate', 'direct'].includes(fields.marketReadMode)) result.marketReadMode = fields.marketReadMode;
   const classified = failureKind(fields);
   if (classified) result.failureKind = classified;

@@ -10,7 +10,7 @@ import { getAddress } from 'ethers';
 import { parseMintLink } from '../src/config.mjs';
 import { LOW_LATENCY_RPC_TIMEOUT_MS } from '../src/rpc-config.mjs';
 import { SNIPE_RACE_WINDOW_MS } from '../src/snipe-race.mjs';
-import { MAX_SNIPE_ATTEMPTS } from '../src/snipe-limits.mjs';
+import { MAX_SNIPE_ATTEMPTS, MAX_PREOPEN_MINTS } from '../src/snipe-limits.mjs';
 import { createUiServer } from '../src/ui-server.mjs';
 
 const prefix = 'corla-ui-test-';
@@ -23,7 +23,7 @@ const mockKeyTwo = 'fixture-not-a-real-key-two';
 const fakeConfigFile = new URL('../config.example.json', import.meta.url);
 
 async function fixture(t, { chainId = 56n, localWallets = false, localConfig, beforeNetwork, beforeWalletImport,
-  beforeInspect, beforeSummary, localUnlock, ...serverOptions } = {}) {
+  beforeInspect, beforeSummary, localUnlock, pendingHealth, ...serverOptions } = {}) {
   const tempParent = await realpath(tmpdir());
   const rootDir = await mkdtemp(join(tempParent, prefix));
   let ui;
@@ -147,10 +147,11 @@ async function fixture(t, { chainId = 56n, localWallets = false, localConfig, be
     async prepareSnipe({ cfg, wallets }) { return { targets: cfg.targets, wallets, armBlock: head }; },
     makeFastSnipe(options) {
       observed.monitors.push(options);
-      return () => new Promise(ok => {
+      const run = () => new Promise(ok => {
         if (options.signal.aborted) ok();
         else options.signal.addEventListener('abort', ok, { once: true });
       });
+      return Object.assign(run, { pendingHealth });
     },
   };
   if (localUnlock) services.createLocalWalletUnlock = () => localUnlock;
@@ -766,7 +767,7 @@ test('sniper concurrency and round settings survive saving, reload, and executio
   const reopened = await ok(await f.get('/api/bootstrap'));
   assert.deepEqual(reopened.config.snipe, strategy);
   assert.deepEqual(reopened.snipeTiming, { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS,
-    maxAttempts: MAX_SNIPE_ATTEMPTS });
+    maxAttempts: MAX_SNIPE_ATTEMPTS, maxPreopenMints: MAX_PREOPEN_MINTS });
   const run = await ok(await f.post('/api/start', liveBody(f, { config: reopened.config, workspace: 'snipe' })));
   assert.equal(run.workspace, 'snipe');
   assert.equal(f.observed.executors[0].broadcastConcurrency, 4);
@@ -876,6 +877,20 @@ test('pending receive time is saved while the run is active, and the latest path
     assert.equal((await ok(await fetch(reopened.url + '/api/state'))).snipeReport, next.snipeReport);
     assert.equal((await fetch(reopened.url + '/' + next.snipeReport)).status, 404);
   } finally { await reopened.close(); }
+});
+
+test('state polling keeps live pending-source health current without re-sending logs and clears it on stop', async t => {
+  let source = { source: 1, mode: 'payload_timeout', healthy: false, hasFullPayload: false, retryMs: 500 };
+  const pendingHealth = () => ({ earlyEnabled: true, requirePreopen: true, targetCount: 1, sources: [source] });
+  const f = await fixture(t, { localWallets: true, pendingHealth });
+  const run = await ok(await f.post('/api/start', snipeBodyFor(f)));
+  assert.equal(run.snipePending.sources[0].mode, 'payload_timeout');
+  const params = new URLSearchParams({ since: run.stateRevision, afterLog: run.logCursor });
+  source = { source: 1, mode: 'full', healthy: true, hasFullPayload: true, pendingLastFullAtMs: 1_794_626_238_617 };
+  const changed = await ok(await f.get('/api/state?' + params));
+  assert.deepEqual(changed, { unchanged: true, stateRevision: run.stateRevision, snipePending: pendingHealth() });
+  const stopped = await ok(await f.post('/api/stop', { workspace: 'snipe' }));
+  assert.equal(stopped.snipePending, undefined);
 });
 
 test('scoped workspace status and preview use verified Corla links without unlocking', async t => {

@@ -75,6 +75,30 @@ test('report stores typed opening-price refusals and safe comparison data, not t
   assert.ok(!JSON.stringify(rows).includes(RPC));
 });
 
+test('the report keeps final-batch progress, hashes and WSS source without retaining calldata or endpoint addresses', async t => {
+  const rootDir = await sandbox(t);
+  const recorder = await createSnipeRunRecorder({ rootDir, targets: [target] });
+  const tail = ['0x' + 'ac'.repeat(32), '0x' + 'bd'.repeat(32), TX];
+  assert.ok(recorder.record('snipe_pending_gate', { token: TOKEN, mint: MINT, quoteBlock: 41, mintedLots: 47n,
+    totalLots: 50n, remainingLots: 3n, pendingMintCount: 3, pendingHashes: tail, pendingTxHash: TX,
+    preopenStage: 'ready', proofMs: 130, calldata: KEY, rpcUrl: RPC }));
+  assert.ok(recorder.record('snipe_pending', { mint: MINT, pendingSource: 2, pendingTxHash: TX,
+    afterLaunchSignal: true, pendingReceivedAtMs: 1_794_626_238_617 }));
+  recorder.record('snipe_pending_gate', { pendingHashes: [RPC, KEY], preopenStage: RPC });
+  await recorder.close();
+  const [, ready, pending, invalid] = await load(rootDir, recorder.fileName);
+  assert.deepEqual([ready.mintedLots, ready.totalLots, ready.remainingLots, ready.pendingMintCount, ready.preopenStage],
+    ['47', '50', '3', 3, 'ready']);
+  assert.deepEqual(ready.pendingHashes, tail);
+  assert.equal(pending.pendingSource, 2);
+  assert.equal(pending.afterLaunchSignal, true);
+  assert.equal(pending.time, new Date(1_794_626_238_617).toISOString());
+  assert.equal(invalid.pendingHashes, undefined);
+  assert.equal(invalid.preopenStage, undefined);
+  assert.ok(!JSON.stringify([ready, pending, invalid]).includes(RPC));
+  assert.ok(!JSON.stringify([ready, pending, invalid]).includes(KEY));
+});
+
 test('per-run file names are unique and report queue caps are explicit', async t => {
   const rootDir = await sandbox(t);
   const first = await createSnipeRunRecorder({ rootDir, targets: [target], armBlock: 41, maxEvents: 2 });

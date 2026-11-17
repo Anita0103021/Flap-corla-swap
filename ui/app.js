@@ -9,7 +9,7 @@ const state = {
   projects: [], logs: [], running: false, mode: 'idle', workspace: null, busy: '', starting: false, stopping: false,
   lastError: '', lastErrorWorkspace: null, editing: -1, pendingProjectRemove: null, pendingWalletRemove: null, liveReview: null,
   preview: null, configRevision: '', stateRevision: '', logCursor: '', reloadRequired: '', cancelingStartup: false,
-  snipeReport: '', snipeTiming: null,
+  snipeReport: '', snipeTiming: null, snipePending: null,
 };
 const localService = { connected: null, supported: false, instance: '', phase: '' };
 const EXPLORER = 'https://bscscan.com';
@@ -27,7 +27,7 @@ const defaults = {
 };
 const refreshJobs = new Map();
 const refreshResults = new Map();
-const SNIPE_PROGRESS_LAST_LOT_MS = 350;
+const SNIPE_PROGRESS_TAIL_MS = 350;
 const SNIPE_PROGRESS_LIVE_MS = 1200;
 const SNIPE_PROGRESS_IDLE_MS = 2500;
 const SNIPE_PROGRESS_BACKOFF_MS = 3800;
@@ -358,6 +358,8 @@ const fmtInt = new Intl.NumberFormat('zh-CN');
 const fmtCompact = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 });
 const fmtScientific = new Intl.NumberFormat('zh-CN', { notation: 'scientific', maximumFractionDigits: 2 });
 const fmtTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+const fmtSnipeTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit',
+  second: '2-digit', fractionalSecondDigits: 3, hourCycle: 'h23' });
 const configCopy = () => structuredClone(state.config);
 function frozen() { return state.running || state.stopping || state.starting || state.cancelingStartup || Boolean(state.busy || state.reloadRequired); }
 
@@ -423,10 +425,12 @@ function setNotice(id, text) {
   $(id).hidden = !text;
 }
 function setConnection(ok, text) {
+  const changed = localService.connected !== ok;
   localService.connected = ok;
   $('connection-dot').className = 'dot ' + (ok ? 'ready' : 'error');
   $('connection-label').textContent = text;
   renderLocalService();
+  if (changed) renderSnipePending();
 }
 function serviceActionAvailable() {
   return localService.connected && localService.supported && !localService.phase && !!state.session &&
@@ -1204,9 +1208,9 @@ function renderProjectList(workspace) {
     const flags = element('div', 'project-flags');
     if (snipe) {
       const newLaunchStatus = state.running && state.workspace === 'snipe' ? '开盘 · 查看狙击日志' : '已开盘，不追买';
-      const lastLot = snipeWaitingForLastLot(row);
-      flags.append(badge(row?.launched ? newLaunchStatus : lastLot ? '剩 1 批 · 待末笔 Mint' : '监控新开盘',
-        row?.launched ? '' : lastLot ? 'amber' : 'violet'));
+      const tail = snipeTailLots(row);
+      flags.append(badge(row?.launched ? newLaunchStatus : tail ? '剩 ' + tail + ' 批 · 关注待打包' : '监控新开盘',
+        row?.launched ? '' : tail ? 'amber' : 'violet'));
       if (target.quoteToken) flags.append(badge(target.amountQuote + ' ' + paymentUnit(target) + ' / 钱包'));
     } else {
       if (target.mintBatches) flags.append(badge('每钱包目标 ' + target.mintBatches + ' 批', 'violet'));
@@ -1270,12 +1274,22 @@ const eventNames = {
   snipe_send: ['向 RPC 发单', 'amber'], snipe_ack: ['RPC 已接收', 'violet'],
   snipe_race_mode: ['竞争路径', 'violet'], snipe_race_attempt: ['竞争提交', 'amber'], snipe_race_outcome: ['竞争结果', 'violet'],
   snipe_pending_feed: ['待打包监听', ''], snipe_pending_match: ['提前量对照', ''], snipe_pending: ['发现待打包 Mint', ''],
+  snipe_pending_gate: ['末段 Mint 检查', 'violet'],
   snipe_report_warning: ['运行记录提醒', 'amber'],
 };
 const feedPhases = { ready: '监听已就绪', subscribed: '已订阅', connecting: '连接中',
   connected: '已连接', retrying: '重连中', reconnecting: '重连中', error: '异常', degraded: '回退中',
   disconnected: '已断开', disabled: '未启用', polling: '补扫中', scanning: '开始补扫',
   active: '补扫正常', busy: '事件队列忙', fallback: 'HTTP 回退' };
+const pendingModes = {
+  connecting: '连接中', subscribed_no_payload: '等待完整推送', full: '完整推送', mixed: '完整／哈希混合',
+  hash_only: '仅哈希', timeout: '连接超时', payload_timeout: '完整推送中断', disconnected: '已断开',
+  error: '订阅请求异常', unsupported: '节点不支持订阅', chain_unverified: 'BSC 校验未通过',
+  transport_unavailable: '连接异常', invalid_config: '地址配置有误', unavailable: '未就绪',
+};
+const pendingModeLabel = mode => Object.hasOwn(pendingModes, mode) ? pendingModes[mode] : '等待状态';
+const pendingFailureModes = new Set(['timeout', 'payload_timeout', 'disconnected', 'hash_only', 'error', 'unsupported',
+  'chain_unverified', 'transport_unavailable', 'invalid_config', 'unavailable']);
 const logStatus = { simulated: '内部验证通过', confirmed: '链上已确认', pending: '待确认', failed: '链上失败', skipped: '已跳过 · 不重发' };
 const logReasons = {
   rpc_limited: 'RPC 限流或不支持日志查询',
@@ -1290,14 +1304,17 @@ function renderLogList(workspace) {
     const tagged = event.workspace ?? (/^buy/.test(event.event) ? 'snipe' : 'mint');
     if (tagged !== workspace && tagged !== 'all') return false;
     if (filter === 'trades') return /^(mint|claim|buy|quote_approval|journal|snipe_send|snipe_ack)/.test(event.event);
-    if (filter === 'errors') return Boolean(event.error || event.event?.endsWith('_skipped') || event.status === 'failed');
+    if (filter === 'errors') return Boolean(event.error || event.event?.endsWith('_skipped') || event.status === 'failed' ||
+      event.event === 'snipe_pending_feed' && pendingFailureModes.has(event.pendingMode));
     return true;
   }).slice(0, 100);
   const rows = entries.map(entry => {
     const row = element('div', 'log-row');
     const [name, tone] = eventNames[entry.event] || [String(entry.event || '事件'), ''];
-    const time = new Date(entry.time);
-    const stamp = element('span', 'log-time', Number.isNaN(time.getTime()) ? '—' : fmtTime.format(time));
+    const time = new Date(entry.event === 'snipe_pending' && Number.isSafeInteger(entry.pendingReceivedAtMs) ?
+      entry.pendingReceivedAtMs : entry.time);
+    const stamp = element('span', 'log-time', Number.isNaN(time.getTime()) ? '—' :
+      (workspace === 'snipe' ? fmtSnipeTime : fmtTime).format(time));
     stamp.title = '北京时间（UTC+8）';
     const details = element('div', 'log-detail');
     const info = [];
@@ -1330,7 +1347,19 @@ function renderLogList(workspace) {
       info.push('已投递 ' + entry.broadcastRpcCount + ' 个 RPC');
     }
     if (Number.isFinite(entry.leadMs)) info.push('比本地开盘通知早 ' + entry.leadMs + ' ms');
-    if (entry.pendingMode && entry.event === 'snipe_pending_feed') info.push(entry.pendingMode);
+    if (entry.event === 'snipe_pending_match' && entry.matchedPending === false) info.push('开盘通知前未捕获末笔');
+    if (Number.isSafeInteger(entry.pendingSource)) info.push('WSS #' + entry.pendingSource);
+    if (entry.pendingMode && entry.event === 'snipe_pending_feed') {
+      info.push(pendingModeLabel(entry.pendingMode));
+      if (Number.isSafeInteger(entry.retryMs)) info.push(entry.retryMs + ' ms 后重连');
+    }
+    if (entry.event === 'snipe_pending_gate') {
+      info.push('父块 #' + entry.quoteBlock + ' · ' + entry.mintedLots + '/' + entry.totalLots + ' 批');
+      if (entry.preopenStage === 'waiting_lots') info.push('未进入最后 ' + (state.snipeTiming?.maxPreopenMints ?? 1) + ' 批');
+      else if (entry.preopenStage === 'waiting_pending') info.push('已有 ' + entry.pendingCandidateCount + ' 笔待打包，需 ' + entry.remainingLots + ' 笔');
+      else if (entry.preopenStage === 'stale_pending') info.push('候选的 nonce 已消耗，等新 Mint');
+      else if (entry.preopenStage === 'ready') info.push(entry.pendingMintCount + ' 笔齐备，进入顺序模拟');
+    }
     if (Number.isFinite(entry.quoteMs)) info.push('发现→验池报价 ' + entry.quoteMs + ' ms');
     if (Number.isFinite(entry.marketMs)) info.push((entry.marketReadMode === 'aggregate' ? '聚合报价' :
       entry.marketReadMode === 'direct' ? '直读报价' : '市场检查') + ' ' + entry.marketMs + ' ms');
@@ -1405,16 +1434,19 @@ function canRefresh(workspace) {
 function snipeProgressVisible() {
   return currentView === 'snipe' && document.visibilityState === 'visible' && canRefresh('snipe');
 }
-function snipeWaitingForLastLot(row) {
-  if (!row || row.error || row.refreshError || row.launched || row.emergencyWithdrawn || row.phase !== 1) return false;
+function snipeTailLots(row) {
+  if (!row || row.error || row.refreshError || row.launched || row.emergencyWithdrawn || row.phase !== 1) return 0;
   const deadline = catalogTimestamp(row.fundingDeadline);
-  if (deadline && deadline <= Date.now() / 1000) return false;
+  if (deadline && deadline <= Date.now() / 1000) return 0;
   const minted = catalogInteger(row.mintedLots), total = catalogInteger(row.totalLots);
-  return minted !== null && total !== null && total - minted === 1n;
+  const configured = state.snipeTiming?.maxPreopenMints;
+  const limit = Number.isSafeInteger(configured) && configured >= 1 && configured <= 3 ? configured : 1;
+  const left = minted === null || total === null ? 0n : total - minted;
+  return left >= 1n && left <= BigInt(limit) ? Number(left) : 0;
 }
 function snipeProgressNearFull() {
   const keys = new Set(targetsOf('snipe').map(target => projectKey(parsedTarget(target) ?? {})).filter(Boolean));
-  return state.projects.some(row => keys.has(projectKey(row)) && snipeWaitingForLastLot(row));
+  return state.projects.some(row => keys.has(projectKey(row)) && snipeTailLots(row) > 0);
 }
 function resumeSnipeProgress(immediate = true) {
   clearTimeout(snipeProgressTimer);
@@ -1426,7 +1458,7 @@ function resumeSnipeProgress(immediate = true) {
   else {
     // Delay from completion, not request start; the dashboard read never overlaps itself.
     const interval = refreshResults.get('snipe')?.error ? SNIPE_PROGRESS_BACKOFF_MS :
-      snipeProgressNearFull() ? SNIPE_PROGRESS_LAST_LOT_MS :
+      snipeProgressNearFull() ? SNIPE_PROGRESS_TAIL_MS :
       state.running && state.workspace === 'snipe' ? SNIPE_PROGRESS_LIVE_MS : SNIPE_PROGRESS_IDLE_MS;
     snipeProgressTimer = setTimeout(load, interval);
   }
@@ -1445,12 +1477,66 @@ function renderRefreshStatus(workspace) {
   const last = refreshResults.get(workspace);
   notice.classList.toggle('snapshot-stale', !loading && Boolean(last?.error));
   const auto = workspace === 'snipe' && snipeProgressVisible();
-  const autoLabel = auto && !last?.error && snipeProgressNearFull() ? '剩 1 批 · 快速刷新' : '自动更新';
+  const autoLabel = auto && !last?.error && snipeProgressNearFull() ? '接近打满 · 快速刷新' : '自动更新';
   const message = loading ? '正在后台刷新，可继续操作' :
     last?.error ? last.error : last ? (auto ? autoLabel + ' · ' : '') + '最近刷新 ' + fmtTime.format(last.at) + ' · ' + last.ms + ' ms' :
       auto ? autoLabel + ' · 等待读取' : '';
   if (notice.textContent !== message) notice.textContent = message;
   notice.hidden = !message;
+}
+function renderSnipePending() {
+  const panel = $('snipe-pending-health');
+  const active = state.workspace === 'snipe' && (state.running || state.starting || state.stopping);
+  panel.hidden = !active;
+  if (!active) return;
+  const details = state.snipePending;
+  const sources = Array.isArray(details?.sources) ? details.sources.slice(0, 3) : [];
+  const full = sources.filter(source => source.healthy).length;
+  const partial = sources.some(source => source.hasFullPayload);
+  let label = '等待读取', tone = '', copy = '等待后台返回待打包监听状态。', show = false;
+  if (localService.connected === false) {
+    label = '本地连接中断'; tone = 'amber';
+    copy = '恢复连接后再确认待打包节点状态；页面上的旧状态不代表节点仍在线。';
+  } else if (state.stopping) {
+    label = '正在停止'; copy = '正在断开待打包监听。';
+  } else if (details) {
+    if (details.disabled || details.targetCount === 0) {
+      label = '未启用'; copy = '当前没有已核验的待打包监听目标。';
+    } else {
+      show = true;
+      if (full) {
+        label = full + '/' + sources.length + ' 完整流';
+        tone = full === sources.length ? 'green' : 'amber';
+      } else if (partial) {
+        label = '部分覆盖'; tone = 'amber';
+      } else {
+        label = sources.some(source => Number.isSafeInteger(source.retryMs)) ? '自动重连中' :
+          sources.some(source => source.mode === 'connecting' || source.mode === 'subscribed_no_payload') ? '等待完整推送' : '暂无完整流';
+        tone = 'amber';
+      }
+      copy = !details.earlyEnabled ? '当前为确认后单轮，待打包监听只用于测速。' :
+        full || partial ? '只代表当前正在接收完整交易；各节点未必能看到每一笔。' :
+          details.requirePreopen ? '提前信号暂不可用；若此时开盘，将按「没抢到开盘就不追」跳过。' :
+            '提前信号暂不可用；开盘确认监听仍独立运行。';
+    }
+  }
+  const badge = $('snipe-pending-status');
+  badge.className = 'badge' + (tone ? ' ' + tone : '');
+  if (badge.textContent !== label) badge.textContent = label;
+  $('snipe-pending-copy').textContent = copy;
+  $('snipe-pending-sources').replaceChildren(...(show ? sources.map(source => {
+    const row = element('li');
+    const info = [pendingModeLabel(source.mode)];
+    if (source.hasFullPayload && source.mode === 'full' && !source.healthy) info[0] += '（近期丢帧）';
+    if (Number.isSafeInteger(source.retryMs)) info.push('约 ' + Math.ceil(source.retryMs / 1000) + ' 秒后重连');
+    if (Number.isSafeInteger(source.pendingLastFullAtMs) && source.pendingLastFullAtMs > 0 &&
+        source.pendingLastFullAtMs <= 8_640_000_000_000_000) {
+      info.push('上次完整推送 ' + fmtTime.format(source.pendingLastFullAtMs));
+    }
+    row.append(element('span', '', source.source === 1 ? '主节点 #1' : '备用 #' + source.source),
+      element('span', '', info.join(' · ')));
+    return row;
+  }) : []));
 }
 function renderWorkspaceControls(workspace) {
   const snipe = workspace === 'snipe';
@@ -1493,6 +1579,7 @@ function renderControls() {
   renderLocalService();
   renderWorkspaceControls('mint');
   renderWorkspaceControls('snipe');
+  renderSnipePending();
   const cancel = $('live-cancel-startup');
   const ownWorkspace = pendingLiveStart?.workspace === state.workspace;
   const checking = state.busy === 'start' || state.cancelingStartup;
@@ -2289,6 +2376,7 @@ function applyRunState(data, fallbackWorkspace = 'mint') {
   state.workspace = data.workspace ?? (state.running ? fallbackWorkspace : null);
   state.starting = Boolean(data.starting);
   state.stopping = Boolean(data.stopping);
+  state.snipePending = state.workspace === 'snipe' ? data.snipePending ?? null : null;
   if (typeof data.snipeReport === 'string' && /^reports\/snipe-runs\/snipe-[\w-]+\.ndjson$/.test(data.snipeReport)) state.snipeReport = data.snipeReport;
 }
 async function updateState() {
@@ -2305,7 +2393,13 @@ async function updateState() {
     if (!state.session || localService.phase || state.reloadRequired === 'SESSION_EXPIRED') return;
     setConnection(true, state.reloadRequired === 'CONFIG_STALE' ? '配置已在其他页面修改' : '本地已连接');
     if (currentView !== 'discover') retryVisibleMetadata();
-    if (d.unchanged) return;
+    if (d.unchanged) {
+      if (observedRunEpoch === runEpoch && state.workspace === 'snipe' && Object.hasOwn(d, 'snipePending')) {
+        state.snipePending = d.snipePending;
+        renderSnipePending();
+      }
+      return;
+    }
     // An older poll may finish after a local save. Do not let that poll
     // invalidate our new revision or skip reconciliation on the next poll.
     const checkRevision = epoch === configEpoch && state.busy !== 'config';
@@ -3154,13 +3248,13 @@ function reviewLive(workspace) {
     const duration = !error && snipeDurationText(attempts);
     if (duration) $('live-summary').append(element('p', '', duration));
     $('live-summary').append(element('p', '', (attempts > 1
-      ? '竞争模式：每项目每钱包最多 ' + attempts + ' 轮。末笔 Mint 可核验时会提前发单，回退会消耗 Gas；按轮预留 Gas。'
+      ? '竞争模式：每项目每钱包最多 ' + attempts + ' 轮。最后几笔 Mint 齐备且顺序模拟通过后会提前发单，回退会消耗 Gas；按轮预留 Gas。'
       : '单次模式：首次有效开盘每钱包只尝试一次。') + ' 开盘窗口：' + settings.windowBlocks + ' 区块；BNB 项目最低储备：' +
       settings.minLiquidityBnb + ' WBNB；当前报价滑点上限：' + settings.slippageBps / 100 + '%；买税 / 卖税上限：' +
       settings.maxBuyTaxBps + ' / ' + settings.maxSellTaxBps + ' bps。'));
     $('live-summary').append(element('p', '', '开盘价溢价上限：' + settings.maxOpeningPremiumBps / 100 +
       '%（' + (settings.maxOpeningPremiumBps === 0 ? '不得高于开盘价' : '相对开盘基准报价') + '）。' +
-      (settings.requirePreopen ? '没抢到开盘就不追：开盘确认后不补买，检测到代币已部署也不再新签。'
+      (settings.requirePreopen ? '没抢到开盘就不追：收到开盘信号后停止新发单，检测到代币已部署也不再新签。'
         : '允许开盘后补买，但开盘基准无法核验或超过上限时不发单。')));
     if (paramsChanged) $('live-summary').append(element('p', '', '本次使用当前狙击表单参数；如需下次复用，请另行保存狙击参数。'));
   }

@@ -5,6 +5,7 @@ import { CORLA_ABI } from '../src/corla.mjs';
 import { FACTORY } from '../src/config.mjs';
 import { actionId } from '../src/monitor.mjs';
 import { makeSnipeRace, SNIPE_RACE_WINDOW_MS } from '../src/snipe-race.mjs';
+import { PreopenMintWait } from '../src/snipe-preopen.mjs';
 
 const target = { factory: FACTORY, mint: '0x' + '12'.repeat(20), token: '0x' + '34'.repeat(20), pricePerLot: 10n };
 const wallet = { address: '0x' + '56'.repeat(20) };
@@ -20,20 +21,26 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const result = (attempt, status) => ({ actionId: job.actionId, attempt, attemptActionId: job.actionId + ':' + attempt,
   ...(status === 'pending' ? { txHash: hash } : {}), status });
 
-function setup({ execute, raceServices = {}, provider = {}, repeatAttempts = 3, requirePreopen = false }) {
+function setup({ execute, raceServices = {}, provider = {}, repeatAttempts = 3, requirePreopen = false,
+  pendingWsUrl = 'wss://primary.example.invalid/', pendingWsBackupUrls = [] }) {
   const abort = new AbortController();
   const rows = [];
   let time = 1_000;
-  let feed;
-  const race = makeSnipeRace({ provider, prepared, settings: { repeatAttempts, requirePreopen }, execute, signal: abort.signal,
+  const feeds = [];
+  const race = makeSnipeRace({ provider, prepared: { ...prepared, pendingWsUrl, pendingWsBackupUrls }, settings: { repeatAttempts, requirePreopen }, execute, signal: abort.signal,
     log: (event, fields) => rows.push({ event, ...fields }), services: {
       nowMs: () => time, delay: async ms => { time += ms; },
+      async preparePreopenMintSequence(_p, _t, candidates, _settings, head) {
+        const latest = candidates().at(-1);
+        if (!latest) throw new PreopenMintWait('waiting_pending', {});
+        return { pendingHashes: [latest.hash], quoteBlock: head.number };
+      },
       makePendingTransactionFeed(options) {
-        feed = options;
+        feeds.push(options);
         return { start: () => options.onStatus({ mode: 'full' }), close() {} };
       }, ...raceServices,
     } });
-  return { race, rows, feed: () => feed, time: () => time, abort };
+  return { race, rows, feed: (i = 0) => feeds[i], time: () => time, abort };
 }
 
 test('confirmed competition reuses the exact order, advances only on reverted receipt, and stops on success', async () => {
@@ -95,9 +102,10 @@ test('a 35-second wait at the penultimate lot uses zero rounds; the final Mint m
   const { race, rows, feed } = setup({
     requirePreopen: true, repeatAttempts: 8, provider: { getBlock: async () => testHead },
     raceServices: { nowMs: () => now, async buildPreopenBuyPlan(_provider, _target, pending) {
-      lookedAt.push(pending.hash);
-      if (pending.hash === hash) throw new Error('still two lots short in parent');
-      return { ...testPlan, pendingHash: pending.hash };
+      const id = pending.pendingHashes.at(-1);
+      lookedAt.push(id);
+      if (id === hash) throw new Error('still two lots short in parent');
+      return { ...testPlan, pendingHash: id };
     } },
     execute: {
       async race(request) {
@@ -135,8 +143,9 @@ test('a new Mint arriving during a previous read is kept unless stale or canonic
     const checked = [];
     const { race, feed } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead },
       raceServices: { nowMs: () => now, async buildPreopenBuyPlan(_p, _target, pending) {
-        checked.push(pending.hash);
-        if (pending.hash === hash) {
+        const id = pending.pendingHashes.at(-1);
+        checked.push(id);
+        if (id === hash) {
           await firstPlan.promise;
           throw new Error('earlier Mint did not fill');
         }
@@ -163,6 +172,133 @@ test('a new Mint arriving during a previous read is kept unless stale or canonic
       assert.equal(sent, scenario === 'queued' ? 1 : 0);
     } finally { firstPlan.resolve(); await race.close(); }
   }
+});
+
+test('a 47/50 parent can use 3 fresh candidates from independent WSS feeds without waiting for 49/50 on chain', async () => {
+  const sent = Promise.withResolvers(), snapshot = Promise.withResolvers();
+  let checks = 0;
+  const tail = [hash, '0x' + 'bc'.repeat(32), '0x' + 'cd'.repeat(32)];
+  const { race, rows, feed, time } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead },
+    pendingWsBackupUrls: ['wss://backup.example.invalid/ws'],
+    raceServices: {
+      async preparePreopenMintSequence(_p, _t, read) {
+        checks++;
+        await snapshot.promise;
+        return { mintedLots: 47n, totalLots: 50n, remainingLots: 3n, pendingCandidateCount: 3, quoteBlock: 100,
+          pendingHashes: read().map(tx => tx.hash) };
+      },
+      async buildPreopenBuyPlan(_p, _t, sequence) {
+        assert.deepEqual(sequence.pendingHashes, tail);
+        return { ...testPlan, pendingHash: tail[2] };
+      },
+    },
+    execute: {
+      async race(request) {
+        await request.beforeSign();
+        request.beforeDispatch();
+        request.onBroadcast('send', { txHash: hash });
+        sent.resolve();
+        return result(1, 'confirmed');
+      },
+      async raceStatus() { assert.fail('no extra wallet order expected'); },
+    },
+  });
+  try {
+    race.start();
+    feed(0).onTransaction(pendingMint(tail[0]), { seen: time(), receivedAtMs: 10 });
+    await tick();
+    feed(1).onTransaction(pendingMint(tail[1]), { seen: time() + 1, receivedAtMs: 11 });
+    feed(0).onTransaction(pendingMint(tail[1]), { seen: time() + 2, receivedAtMs: 12 });
+    feed(1).onTransaction(pendingMint(tail[2]), { seen: time() + 3, receivedAtMs: 13 });
+    snapshot.resolve();
+    await Promise.race([sent.promise, tick().then(tick)]);
+    assert.equal(checks, 1);
+    assert.deepEqual(rows.filter(r => r.event === 'snipe_pending').map(r => r.pendingSource), [1, 2, 2]);
+    const [submission] = rows.filter(r => r.event === 'snipe_send');
+    assert.deepEqual(submission?.pendingHashes, tail);
+    race.noteConfirmed({ ...target, blockNumber: 101, txHash: tail[2], source: 'ws' }, time() + 40);
+    assert.equal(rows.find(r => r.event === 'snipe_pending_match').pendingSource, 2);
+  } finally { snapshot.resolve(); await race.close(); }
+});
+
+test('a launch signal pauses the strict early-only path before the receipt lookup completes', async () => {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let signed = 0, reason;
+  const { race, feed } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead },
+    raceServices: { buildPreopenBuyPlan: async () => testPlan },
+    execute: {
+      async race(request) {
+        entered.resolve();
+        await release.promise;
+        try { await request.beforeSign(); request.beforeDispatch(); signed++; }
+        catch (e) { reason = e.message; }
+        return result(0, 'skipped');
+      },
+      async raceStatus() { assert.fail('no order shall be watched'); },
+    },
+  });
+  try {
+    race.start();
+    feed().onTransaction(pendingMint());
+    try {
+      await entered.promise;
+      race.noteLaunchSignal({ ...target, blockNumber: 101, txHash: hash, blockHash: hash });
+    } finally { release.resolve(); }
+    await tick();
+    assert.equal(signed, 0);
+    assert.match(reason, /收到开盘信号/);
+  } finally { release.resolve(); await race.close(); }
+});
+
+test('receipt verification retries do not turn a late WSS pending frame into early coverage', async () => {
+  const { race, rows, feed } = setup({ repeatAttempts: 1, execute: {} });
+  try {
+    race.start();
+    const opened = { ...target, blockNumber: 101, txHash: hash, blockHash: hash, source: 'ws' };
+    assert.equal(race.noteLaunchSignal(opened, 1000).first, true);
+    feed().onTransaction(pendingMint(), { seen: 1010, receivedAtMs: 20 });
+    assert.deepEqual(race.noteLaunchSignal({ ...opened, source: 'http' }, 1100), { seen: 1000, source: 'ws', first: false });
+    race.noteConfirmed({ ...opened, source: 'http' }, 1100);
+    const row = rows.find(entry => entry.event === 'snipe_pending_match');
+    assert.equal(row.matchedPending, false);
+    assert.equal(row.source, 'ws');
+    assert.equal(row.leadMs, undefined);
+  } finally { await race.close(); }
+});
+
+test('an invalid primary leaves a healthy backup active and diagnostics never expose node addresses', async () => {
+  const { race, feed, rows } = setup({ repeatAttempts: 1, execute: {},
+    pendingWsUrl: 'https://invalid.example/fixture-secret', pendingWsBackupUrls: ['wss://valid.example/fixture-secret'] });
+  try {
+    race.start();
+    assert.equal(feed().wsUrl, 'wss://valid.example/fixture-secret');
+    assert.equal(feed(1), undefined);
+    feed().onStatus({ mode: 'full', healthy: true, hasFullPayload: true, pendingLastFullAtMs: 2030 });
+    const status = race.pendingHealth();
+    assert.deepEqual(status.sources.map(row => [row.source, row.mode, row.healthy]), [[1, 'invalid_config', false], [2, 'full', true]]);
+    feed().onTransaction(pendingMint(), { seen: 1_000, receivedAtMs: 2_030, mode: 'full' });
+    assert.equal(rows.find(row => row.event === 'snipe_pending').pendingSource, 2);
+    assert.ok(!JSON.stringify([status, rows]).includes('fixture-secret'));
+  } finally { await race.close(); }
+});
+
+test('opening telemetry keeps the pending outage at first discovery even if WSS recovers before receipt verification', async () => {
+  const { race, rows, feed } = setup({ repeatAttempts: 1, execute: {} });
+  try {
+    race.start();
+    const opened = { ...target, blockNumber: 101, txHash: hash, blockHash: hash, source: 'ws' };
+    feed().onStatus({ mode: 'payload_timeout', retryMs: 500, pendingLastFullAtMs: 2500 });
+    race.noteLaunchSignal(opened, 1200);
+    feed().onStatus({ mode: 'full', healthy: true, hasFullPayload: true, pendingLastFullAtMs: 3000 });
+    assert.equal(race.pendingHealth().sources[0].healthy, true);
+    race.noteConfirmed(opened, 1600);
+    const row = rows.find(entry => entry.event === 'snipe_pending_match');
+    assert.equal(row.matchedPending, false);
+    assert.equal(row.pendingMode, 'payload_timeout');
+    assert.equal(row.fullFeedHealthy, false);
+    assert.equal(row.pendingHealthyCount, 0);
+    assert.equal(row.pendingLastFullAtMs, 2500);
+  } finally { await race.close(); }
 });
 
 test('a slow pre-sign check does not open a round after the retry deadline', async () => {

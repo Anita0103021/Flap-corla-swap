@@ -13,6 +13,9 @@ const quoteMintFunction = CORLA_QUOTE_ABI.getFunction('mintQuote');
 const MAX_INPUT_CHARS = 2 + 2 * (4 + 96 + 32 * 64);
 const MAX_WS_CHARS = 128 * 1024;
 const MAX_PER_SECOND = 4096;
+const PENDING_CONNECT_MS = 5_000;
+const FULL_PAYLOAD_TIMEOUT_MS = 8_000;
+const STABLE_PAYLOAD_MS = 15_000;
 const PENDING_AGE_MS = 120_000;
 const MAX_PENDING = 4096;
 const MAX_INCLUSIONS = 1024;
@@ -28,6 +31,25 @@ export function pendingWsUrl(value) {
         !url.hash && !url.username && !url.password) return url.href;
   } catch { /* keep endpoint details out of the error */ }
   throw new Error('待打包订阅需要 wss:// 或本机 ws:// 地址');
+}
+
+export function pendingWsSources(primary, backups = '') {
+  let invalidBackups = false;
+  if (typeof backups === 'string') {
+    if (backups.length > 8192) { invalidBackups = true; backups = []; }
+    else backups = backups.split(',').map(row => row.trim()).filter(Boolean);
+  }
+  if (!Array.isArray(backups)) { invalidBackups = true; backups = []; }
+  if (backups.length > 2) invalidBackups = true;
+  const seen = new Set(), sources = [];
+  for (const [i, value] of [primary, ...backups.slice(0, 2)].entries()) {
+    let url;
+    try { url = pendingWsUrl(value); } catch { /* keep the failure confined to this slot */ }
+    if (url && seen.has(url)) continue;
+    if (url) seen.add(url);
+    sources.push({ source: i + 1, url });
+  }
+  return { sources, invalidBackups };
 }
 
 /** Verify the exact configured factory/proxy/token and active funding phase
@@ -183,18 +205,28 @@ export function makePendingTransactionFeed({
 }) {
   const endpoint = pendingWsUrl(wsUrl);
   const { WebSocket = globalThis.WebSocket, clock = () => performance.now(), wallClock = Date.now,
-    connectTimeoutMs = 5000, staleMs = 20000, maxPerSecond = MAX_PER_SECOND } = services;
-  let mode = 'idle', socket, timer, heartbeat, reconnect, stopped = false, started = false, epoch = 0;
-  let connections = 0, full = 0, hashes = 0, dropped = 0, unrecognized = 0, lastDrop = -Infinity;
-  let lastPayload = -Infinity, fullInEpoch = 0, hashesInEpoch = 0, second = -1, inSecond = 0;
-  const report = next => {
-    if (mode === next) return;
+    connectTimeoutMs = PENDING_CONNECT_MS, staleMs = FULL_PAYLOAD_TIMEOUT_MS, maxPerSecond = MAX_PER_SECOND,
+    setTimer = setTimeout, clearTimer = clearTimeout } = services;
+  let mode = 'idle', socket, timer, watchdog, reconnect, retryAt, stopped = false, started = false, epoch = 0;
+  let connections = 0, failures = 0, full = 0, hashes = 0, dropped = 0, unrecognized = 0, lastDrop = -Infinity;
+  let lastPayload = -Infinity, lastFullAtMs, fullInEpoch = 0, hashesInEpoch = 0, second = -1, inSecond = 0;
+
+  function status() {
+    const now = clock();
+    const hasFullPayload = !stopped && Boolean(socket) && now - lastPayload < staleMs;
+    return { mode, hasFullPayload, healthy: mode === 'full' && hasFullPayload && now - lastDrop > staleMs,
+      connections, reconnects: Math.max(0, epoch - 1), fullMessages: full, hashMessages: hashes, droppedMessages: dropped,
+      unrecognizedMessages: unrecognized, ...(lastFullAtMs === undefined ? {} : { pendingLastFullAtMs: lastFullAtMs }),
+      ...(retryAt === undefined ? {} : { retryMs: Math.max(0, Math.ceil(retryAt - now)) }) };
+  }
+  const report = (next, force = false) => {
+    if (!force && mode === next) return;
     mode = next;
-    try { onStatus?.({ mode }); } catch { /* diagnostics only */ }
+    try { onStatus?.(status()); } catch { /* diagnostics only */ }
   };
   function disconnect() {
-    clearTimeout(timer);
-    clearInterval(heartbeat);
+    clearTimer(timer);
+    clearTimer(watchdog);
     const old = socket;
     socket = undefined;
     try { old?.close(); } catch { /* transports may already be closed */ }
@@ -202,7 +234,8 @@ export function makePendingTransactionFeed({
   function close() {
     if (stopped) return;
     stopped = true;
-    clearTimeout(reconnect);
+    clearTimer(reconnect);
+    retryAt = undefined;
     disconnect();
     signal?.removeEventListener('abort', close);
   }
@@ -210,24 +243,45 @@ export function makePendingTransactionFeed({
     if (stopped || signal?.aborted) return;
     const thisEpoch = ++epoch;
     fullInEpoch = hashesInEpoch = 0;
+    second = -1;
+    inSecond = 0;
     lastPayload = -Infinity;
+    retryAt = undefined;
     report('connecting');
+    if (stopped || signal?.aborted) return;
     let conn;
-    let handshake = 1, subscription, requestId = 2, pingAt, pingId;
+    let handshake = 1, subscription, subscribedAt, stableFrom;
     const active = () => !stopped && epoch === thisEpoch && socket === conn;
+    const retryLater = reason => {
+      if (stopped || signal?.aborted) return;
+      const wait = 500 * 2 ** failures;
+      failures = Math.min(failures + 1, 4);
+      retryAt = clock() + wait;
+      reconnect = setTimer(connect, wait);
+      report(reason, true);
+    };
     const fail = (reason = 'disconnected', retry = true) => {
       if (!active()) return;
       disconnect();
-      report(reason);
-      if (retry && !stopped && epoch < 4) reconnect = setTimeout(connect, Math.min(4000, 500 * 2 ** (epoch - 1)));
+      if (retry) retryLater(reason);
+      else report(reason);
     };
     try { conn = socket = new WebSocket(endpoint); }
-    catch { report('transport_unavailable'); return; }
+    catch { retryLater('transport_unavailable'); return; }
     const send = (id, method, params) => {
       try { conn.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); }
       catch { fail(); }
     };
-    timer = setTimeout(() => fail('timeout'), connectTimeoutMs);
+    // The subscription's actual data is the heartbeat. A successful
+    // eth_blockNumber response says nothing about pending delivery, and a
+    // lost ping response should not drop a still-working subscription.
+    function checkPayload() {
+      if (!active()) return;
+      const left = staleMs - (clock() - (fullInEpoch ? lastPayload : subscribedAt));
+      if (left > 0) { watchdog = setTimer(checkPayload, Math.ceil(left)); return; }
+      fail(!fullInEpoch && hashesInEpoch ? 'hash_only' : 'payload_timeout');
+    }
+    timer = setTimer(() => fail('timeout'), connectTimeoutMs);
     conn.addEventListener('open', () => { if (active()) send(1, 'eth_chainId', []); });
     conn.addEventListener('close', () => fail());
     conn.addEventListener('error', () => fail());
@@ -245,49 +299,42 @@ export function makePendingTransactionFeed({
       let packet;
       try { packet = JSON.parse(data); } catch { unrecognized++; return; }
       if (handshake === 1 && packet?.id === 1) {
-        if (packet.error || typeof packet.result !== 'string' || !/^0x0*38$/i.test(packet.result)) return fail('chain_unverified', false);
+        if (packet.error || !quantity(packet.result)) return fail('chain_unverified');
+        if (BigInt(packet.result) !== 56n) return fail('chain_unverified', false);
         handshake = 2;
         return send(2, 'eth_subscribe', ['newPendingTransactions', true]);
       }
       if (handshake === 2 && packet?.id === 2) {
+        if ([-32601, -32602].includes(packet.error?.code)) return fail('unsupported', false);
         if (packet.error || typeof packet.result !== 'string' || !/^0x[0-9a-f]{1,128}$/i.test(packet.result)) {
-          return fail('unsupported', false);
+          return fail('error');
         }
         handshake = 3;
         subscription = packet.result;
+        subscribedAt = now;
         connections++;
-        clearTimeout(timer);
+        clearTimer(timer);
+        watchdog = setTimer(checkPayload, staleMs);
         report('subscribed_no_payload');
-        heartbeat = setInterval(() => {
-          if (!active()) return;
-          if (pingAt !== undefined) {
-            if (clock() - pingAt >= staleMs) fail('timeout');
-            return;
-          }
-          pingAt = clock();
-          pingId = ++requestId;
-          send(pingId, 'eth_blockNumber', []);
-        }, 10_000);
         return;
       }
       if (handshake !== 3) return;
-      if (pingAt !== undefined && packet?.id === pingId) {
-        if (packet.error || !quantity(packet.result)) return fail();
-        pingAt = undefined;
-        return;
-      }
       if (packet?.method !== 'eth_subscription' || packet.params?.subscription !== subscription) return;
       const item = packet.params.result;
       if (typeof item === 'string' && hash(item)) { hashes++; hashesInEpoch++; }
       else if (item && hash(item.hash) && address(item.from) && (item.to == null || address(item.to)) &&
-          quantity(item.value) && typeof (item.input ?? item.data) === 'string') {
+          quantity(item.value) && typeof (item.input ?? item.data) === 'string' &&
+          item.blockHash == null && item.blockNumber == null && item.transactionIndex == null) {
         full++;
         fullInEpoch++;
+        if (stableFrom === undefined || now - lastPayload >= staleMs) stableFrom = now;
         lastPayload = now;
+        lastFullAtMs = receivedAtMs;
+        if (now - stableFrom >= STABLE_PAYLOAD_MS) failures = 0;
         try { onTransaction(item, { receivedAtMs, seen: now, mode: hashesInEpoch ? 'mixed' : 'full' }); }
         catch { /* never let telemetry kill the feed */ }
       } else { unrecognized++; return; }
-      report(fullInEpoch && hashesInEpoch ? 'mixed' : fullInEpoch ? 'full' : 'hash_only');
+      if (active()) report(fullInEpoch && hashesInEpoch ? 'mixed' : fullInEpoch ? 'full' : 'hash_only');
     });
   }
   return {
@@ -299,10 +346,6 @@ export function makePendingTransactionFeed({
       else connect();
     },
     close,
-    status() {
-      const now = clock();
-      return { mode, healthy: mode === 'full' && now - lastPayload <= staleMs && now - lastDrop > staleMs,
-        connections, fullMessages: full, hashMessages: hashes, droppedMessages: dropped, unrecognizedMessages: unrecognized };
-    },
+    status,
   };
 }
