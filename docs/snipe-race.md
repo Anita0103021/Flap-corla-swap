@@ -23,6 +23,23 @@
 
 ## 对比看哪些字段
 
+### 2026-11-18：候选有效性与诊断补强
+
+- ABI 匹配的首帧不再直接占用执行去重名额。另一来源随后送来的同哈希完整签名允许升级，已核验候选保留不可变快照；不完整或伪签名帧不启动父块/顺序模拟。准备阶段的失败签名缓存也允许被同哈希的新对象修复。
+- 模拟结束、签名前、投递前核对所选 Mint 是否已被已观察到的有效同 sender/nonce 交易替换或超过候选时限。头块未前进不增加 nonce RPC；头块前进才按选中 sender 并行核对最新 nonce，避免沿用已经消耗的 nonce。只覆盖实际观察到的有效替换，不能推断私有交易池；当前纯签名校验不覆盖 `to=null` 合约创建取消。
+- 开盘通知计时沿用 feed 最初收包的 monotonic 时间，不在排队后重置起点。此项修正的是测量准确性，不是消除了真实网络延迟。
+- 新增 `snipe_pending_source`：每源首见匹配对象与首次完整签名的到达。`signatureVerified` 区分残缺帧和可还原签名；不记录签名或原始交易。
+- 新增 `snipe_pending_source_match`：按准确开盘哈希和来源记录已验签交易的有符号 `leadMs`（正=本机先见，负=迟到，`null`=未见有效签名）。确认后才收到的签名会补记迟到结果，不会触发新买入。流健康与这笔交易是否提前可用分开判断。
+- `snipe_first_buy.amountIn` 为兼容旧日志仍指首条观察到的买入 Swap。只有补查到同一成功回执，核对区块哈希/交易索引并从 receipt.logs 汇总后，才设置 `firstBuyAggregationComplete=true`：`firstBuyTotalIn` 为同一交易、同一池所有买入腿的投入总额，`firstBuyQuoteOut` 为卖出腿的支付币返还，并提供买/卖腿次数。重复 logIndex 只计一次；缺少回执或 logIndex 不声称已得出完整合计。首买身份仍是指定区块范围内 RPC 观察到的最早买入，不据此保证上游没有漏掉更早的其他交易。
+
+离线分析一份运行文件：
+
+```powershell
+node scripts/analyze-snipe-run.mjs '<单份 snipe-*.ndjson 的路径>'
+```
+
+分析器只投影公开哈希、数字和固定诊断码，不重新查链、不读钱包。旧日志没有逐源验签信息时给出 `null`/unknown，不冒充 0% 覆盖；按事件输出阶段 p50/p95，不能把并行阶段分位数相加作为端到端延迟。
+
 - `snipe_pending`：完整待打包 Mint 进入本机 WS 消息回调时的时间，`time` 为 UTC（含毫秒），`pendingReceivedAtMs` 是同一时刻的 Unix 毫秒值，用 `pendingTxHash` 查找。`pendingSource` 是最早收到它的 WSS 编号，不保存节点地址。这不是广播或区块时间。是否为最终开盘的末笔，要看同哈希的开盘事件；节点没有推送的候选不会有接收记录。
 - `snipe_pending_feed`：各路订阅、断线与重连的变化。`payload_timeout` 表示完整交易流停顿；`retryMs` 是计划等待时长，`pendingLastFullAtMs` 是该路最后一次收到完整交易的时间。
 - `snipe_pending_gate`：父块进度、可见候选数、是尚未进入最后三批（`waiting_lots`）、候选未齐（`waiting_pending`）、候选 nonce 已被父块消耗（`stale_pending`），还是已经齐备并进入顺序模拟（`ready`）。齐备时保存有序 `pendingHashes`。`headMs`、`proofMs` 和 `planMs` 分别度量父块查询、项目/发送者核验与各钱包模拟。

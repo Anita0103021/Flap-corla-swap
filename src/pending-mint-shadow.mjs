@@ -201,7 +201,7 @@ export function makePendingMintShadow({
 /** Standard full-pending subscription. Hash-only streams are never expanded
  * into one HTTP lookup per hash, and they are explicitly reported. */
 export function makePendingTransactionFeed({
-  wsUrl, signal, onTransaction, onStatus, services = {},
+  wsUrl, signal, onTransaction, onHash, onStatus, services = {},
 }) {
   const endpoint = pendingWsUrl(wsUrl);
   const { WebSocket = globalThis.WebSocket, clock = () => performance.now(), wallClock = Date.now,
@@ -321,7 +321,11 @@ export function makePendingTransactionFeed({
       if (handshake !== 3) return;
       if (packet?.method !== 'eth_subscription' || packet.params?.subscription !== subscription) return;
       const item = packet.params.result;
-      if (typeof item === 'string' && hash(item)) { hashes++; hashesInEpoch++; }
+      if (typeof item === 'string' && hash(item)) {
+        hashes++; hashesInEpoch++;
+        try { onHash?.(item, { receivedAtMs, seen: now, mode: fullInEpoch ? 'mixed' : 'hash_only' }); }
+        catch { /* optional telemetry; do not resolve hashes via RPC */ }
+      }
       else if (item && hash(item.hash) && address(item.from) && (item.to == null || address(item.to)) &&
           quantity(item.value) && typeof (item.input ?? item.data) === 'string' &&
           item.blockHash == null && item.blockNumber == null && item.transactionIndex == null) {

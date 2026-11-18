@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toQuantity } from 'ethers';
+import { Transaction, Wallet, toQuantity } from 'ethers';
 import { CORLA_ABI } from '../src/corla.mjs';
 import { FACTORY } from '../src/config.mjs';
 import { actionId } from '../src/monitor.mjs';
 import { makeSnipeRace, SNIPE_RACE_WINDOW_MS } from '../src/snipe-race.mjs';
 import { PreopenMintWait } from '../src/snipe-preopen.mjs';
+import { hasReproducibleBscEnvelope } from '../src/snipe-pending-compare.mjs';
 
 const target = { factory: FACTORY, mint: '0x' + '12'.repeat(20), token: '0x' + '34'.repeat(20), pricePerLot: 10n };
 const wallet = { address: '0x' + '56'.repeat(20) };
@@ -20,16 +21,28 @@ const testPlan = { tx, gasEstimate: 25_000n, quoteBlock: 100, quoteBlockHash: ha
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const result = (attempt, status) => ({ actionId: job.actionId, attempt, attemptActionId: job.actionId + ':' + attempt,
   ...(status === 'pending' ? { txHash: hash } : {}), status });
+const minter = Wallet.createRandom();
+async function signedPending(overrides = {}, signer = minter) {
+  const signed = Transaction.from(await signer.signTransaction({ chainId: 56, type: 0, nonce: 7,
+    to: target.mint, value: target.pricePerLot, gasLimit: 100_000n, gasPrice: 100_000_000n,
+    data: CORLA_ABI.encodeFunctionData('mint', [[]]), ...overrides }));
+  return { hash: signed.hash, from: signed.from, to: signed.to, input: signed.data, value: toQuantity(signed.value),
+    type: '0x0', nonce: toQuantity(signed.nonce), gas: toQuantity(signed.gasLimit), gasPrice: toQuantity(signed.gasPrice),
+    v: toQuantity(signed.signature.networkV), r: signed.signature.r, s: signed.signature.s, blockNumber: null };
+}
 
 function setup({ execute, raceServices = {}, provider = {}, repeatAttempts = 3, requirePreopen = false,
-  pendingWsUrl = 'wss://primary.example.invalid/', pendingWsBackupUrls = [] }) {
+  pendingWsUrl = 'wss://primary.example.invalid/', pendingWsBackupUrls = [], pendingTargets = prepared.pendingTargets }) {
   const abort = new AbortController();
   const rows = [];
   let time = 1_000;
   const feeds = [];
-  const race = makeSnipeRace({ provider, prepared: { ...prepared, pendingWsUrl, pendingWsBackupUrls }, settings: { repeatAttempts, requirePreopen }, execute, signal: abort.signal,
+  const race = makeSnipeRace({ provider, prepared: { ...prepared, pendingTargets, pendingWsUrl, pendingWsBackupUrls }, settings: { repeatAttempts, requirePreopen }, execute, signal: abort.signal,
     log: (event, fields) => rows.push({ event, ...fields }), services: {
       nowMs: () => time, delay: async ms => { time += ms; },
+      // Existing race-control fixtures deliberately omit signed envelopes.
+      // Real signature/path poisoning tests below explicitly use the validator.
+      hasReproducibleBscEnvelope: () => true,
       async preparePreopenMintSequence(_p, _t, candidates, _settings, head) {
         const latest = candidates().at(-1);
         if (!latest) throw new PreopenMintWait('waiting_pending', {});
@@ -251,11 +264,13 @@ test('a launch signal pauses the strict early-only path before the receipt looku
 });
 
 test('receipt verification retries do not turn a late WSS pending frame into early coverage', async () => {
-  const { race, rows, feed } = setup({ repeatAttempts: 1, execute: {} });
+  let now = 1000;
+  const { race, rows, feed } = setup({ repeatAttempts: 1, execute: {}, raceServices: { nowMs: () => now } });
   try {
     race.start();
     const opened = { ...target, blockNumber: 101, txHash: hash, blockHash: hash, source: 'ws' };
     assert.equal(race.noteLaunchSignal(opened, 1000).first, true);
+    now = 1010;
     feed().onTransaction(pendingMint(), { seen: 1010, receivedAtMs: 20 });
     assert.deepEqual(race.noteLaunchSignal({ ...opened, source: 'http' }, 1100), { seen: 1000, source: 'ws', first: false });
     race.noteConfirmed({ ...opened, source: 'http' }, 1100);
@@ -387,4 +402,245 @@ test('strict early-only mode blocks new pending signatures once the token is dep
     assert.match(rejection?.message ?? '', /不继续提交/);
     assert.equal(codeCalls, canonicalSignal ? 0 : 1);
   }
+});
+
+test('incomplete or forged first source cannot poison the same hash delivered completely by a backup', async () => {
+  const good = await signedPending();
+  for (const first of [{ ...good, r: undefined, s: undefined }, { ...good, r: '0x' + 'ff'.repeat(32) }]) {
+    let plans = 0, submitted = 0, heads = 0, now = 1000, envelopeChecks = 0;
+    const { race, rows, feed } = setup({ requirePreopen: true, pendingWsBackupUrls: ['wss://backup.example.invalid/'],
+      provider: { async getBlock() { heads++; return testHead; } }, raceServices: {
+        hasReproducibleBscEnvelope(frame) { envelopeChecks++; return hasReproducibleBscEnvelope(frame); }, nowMs: () => now,
+        async buildPreopenBuyPlan(_p, _target, sequence) {
+          plans++;
+          assert.deepEqual(sequence.pendingHashes, [good.hash]);
+          now += 25;
+          return { ...testPlan, pendingHash: good.hash };
+        },
+      }, execute: {
+        async race(request) {
+          await request.beforeSign(); request.beforeDispatch(); request.onBroadcast('send', { txHash: hash });
+          submitted++; return result(1, 'confirmed');
+        },
+        async raceStatus() { assert.fail('no unresolved order'); },
+      } });
+    try {
+      race.start();
+      feed(0).onTransaction(first, { seen: 1000 });
+      feed(0).onTransaction(first, { seen: 1000 });
+      await tick();
+      assert.equal(heads, 0, 'unverifiable frame must not start contract/RPC inspection');
+      now += 50;
+      feed(1).onTransaction(good, { seen: now });
+      feed(0).onTransaction(good, { seen: now });
+      await tick();
+      assert.equal(plans, 1);
+      assert.equal(submitted, 1);
+      assert.equal(envelopeChecks, 2, 'repeated failed frames and identical signed bytes across sources do not repeat signature recovery');
+      assert.equal(rows.find(row => row.event === 'snipe_send').elapsedMs, 25,
+        'execution timing must begin at the complete signed envelope, not the incomplete first object');
+      assert.deepEqual(rows.filter(row => row.event === 'snipe_pending_source').map(row =>
+        [row.pendingSource, row.signatureVerified]), [[1, false], [2, true], [1, true]]);
+    } finally { await race.close(); }
+  }
+});
+
+test('source telemetry measures signed-envelope arrival, not an earlier incomplete object, and records late upgrades', async () => {
+  const good = await signedPending();
+  let now = 1000;
+  const { race, rows, feed } = setup({ repeatAttempts: 1, execute: {}, pendingWsBackupUrls: ['wss://backup.example.invalid/'],
+    raceServices: { hasReproducibleBscEnvelope, nowMs: () => now } });
+  try {
+    race.start();
+    feed(0).onTransaction({ ...good, r: undefined, s: undefined }, { seen: now, receivedAtMs: 10 });
+    now = 1100;
+    const opened = { ...target, blockNumber: 101, txHash: good.hash, blockHash: hash, source: 'ws' };
+    race.noteLaunchSignal(opened, now);
+    race.noteConfirmed(opened, now);
+    assert.equal(rows.find(row => row.event === 'snipe_pending_match').matchedPending, false);
+    assert.deepEqual(rows.filter(row => row.event === 'snipe_pending_source_match').map(row => row.leadMs), [null, null]);
+    now = 1120;
+    feed(1).onTransaction(good, { seen: now, receivedAtMs: 20 });
+    now = 1130;
+    feed(0).onTransaction(good, { seen: now, receivedAtMs: 30 });
+    feed(0).onTransaction(good, { seen: now, receivedAtMs: 30 });
+    const late = rows.filter(row => row.event === 'snipe_pending_source_match' && row.signatureVerified);
+    assert.deepEqual(late.map(row => [row.pendingSource, row.leadMs, row.matchedPending, row.seenBeforeLocalConfirmation]),
+      [[2, -20, false, false], [1, -30, false, false]]);
+    assert.equal(rows.filter(row => row.event === 'snipe_race_mode').length, 0);
+  } finally { await race.close(); }
+});
+
+test('a verified same-nonce replacement arriving during planning invalidates the old plan before ownership', async () => {
+  const good = await signedPending(), replacement = await signedPending({ gasPrice: 120_000_000n });
+  const release = Promise.withResolvers();
+  const planned = [], submitted = [];
+  const { race, feed, rows } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead }, raceServices: {
+    hasReproducibleBscEnvelope,
+    async buildPreopenBuyPlan(_p, _t, sequence) {
+      const selected = sequence.pendingHashes.at(-1);
+      planned.push(selected);
+      if (selected === good.hash) await release.promise;
+      return { ...testPlan, pendingHash: selected };
+    },
+  }, execute: {
+    async race(request) { await request.beforeSign(); request.beforeDispatch(); submitted.push(request.preopenPlan.pendingHash); return result(1, 'confirmed'); },
+    async raceStatus() { assert.fail('no unresolved order'); },
+  } });
+  try {
+    race.start();
+    feed().onTransaction(good);
+    await tick();
+    feed().onTransaction(replacement);
+    release.resolve();
+    await tick();
+    assert.deepEqual(planned, [good.hash, replacement.hash]);
+    assert.deepEqual(submitted, [replacement.hash]);
+    assert.match(rows.find(row => row.event === 'buy_skipped')?.error ?? '', /nonce 已被新签名交易替换/);
+  } finally { release.resolve(); await race.close(); }
+});
+
+test('an observed signed self-transfer cancellation blocks the already planned Mint immediately before signing', async () => {
+  const good = await signedPending(), cancel = await signedPending({ to: minter.address, value: 0n, data: '0x', gasPrice: 130_000_000n });
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let signed = 0, rejection;
+  const { race, feed } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead }, raceServices: {
+    hasReproducibleBscEnvelope, buildPreopenBuyPlan: async () => ({ ...testPlan, pendingHash: good.hash }),
+  }, execute: {
+    async race(request) {
+      entered.resolve();
+      await release.promise;
+      try { await request.beforeSign(); request.beforeDispatch(); signed++; }
+      catch (error) { rejection = error.message; }
+      return result(0, 'skipped');
+    }, async raceStatus() { assert.fail('no signature or order'); },
+  } });
+  try {
+    race.start();
+    feed().onTransaction(good);
+    await entered.promise;
+    feed().onTransaction(cancel);
+    release.resolve();
+    await tick();
+    assert.equal(signed, 0);
+    assert.match(rejection ?? '', /nonce 已被新签名交易替换/);
+  } finally { release.resolve(); await race.close(); }
+});
+
+test('source object mutation cannot change the verified queued envelope while the head read is in flight', async () => {
+  const good = await signedPending(), original = good.hash;
+  const release = Promise.withResolvers();
+  let first = true, planned;
+  const { race, feed } = setup({ requirePreopen: true, provider: { async getBlock() {
+    if (first) { first = false; await release.promise; } return testHead;
+  } }, raceServices: { hasReproducibleBscEnvelope,
+    async buildPreopenBuyPlan(_p, _t, sequence) { planned = sequence.pendingHashes.at(-1); return { ...testPlan, pendingHash: planned }; },
+  }, execute: {
+    async race(request) { await request.beforeSign(); request.beforeDispatch(); return result(1, 'confirmed'); },
+    async raceStatus() { assert.fail('no unresolved order'); },
+  } });
+  try {
+    race.start();
+    feed().onTransaction(good);
+    good.hash = hash;
+    good.input = '0x';
+    release.resolve();
+    await tick();
+    assert.equal(planned, original);
+  } finally { release.resolve(); await race.close(); }
+});
+
+test('only a newer head rechecks the selected minter nonce; consumed nonce prevents signing', async () => {
+  const good = await signedPending();
+  for (const [advanced, consumed] of [[false, false], [true, false], [true, true]]) {
+    let initialHead = true, nonceReads = 0, signed = 0, rejection;
+    const { race, feed } = setup({ requirePreopen: true, provider: {
+      async getBlock(tag) {
+        if (initialHead) { initialHead = false; return testHead; }
+        return tag === 'latest' && advanced ? { ...testHead, number: 101 } : testHead;
+      },
+      async getTransactionCount(address, block) {
+        nonceReads++;
+        assert.equal(address, minter.address.toLowerCase());
+        assert.equal(block, 101);
+        return consumed ? 8 : 7;
+      }, async getCode() { return '0x'; },
+    }, raceServices: { hasReproducibleBscEnvelope, buildPreopenBuyPlan: async () => ({ ...testPlan, pendingHash: good.hash }) },
+    execute: {
+      async race(request) {
+        try { await request.beforeSign(); request.beforeDispatch(); signed++; }
+        catch (error) { rejection = error.message; }
+        return result(consumed ? 0 : 1, consumed ? 'skipped' : 'confirmed');
+      }, async raceStatus() { assert.fail('no unresolved order'); },
+    } });
+    try {
+      race.start();
+      feed().onTransaction(good);
+      await tick();
+      assert.equal(nonceReads, Number(advanced));
+      assert.equal(signed, Number(!consumed));
+      if (consumed) assert.match(rejection ?? '', /nonce 已在新父块变化/);
+    } finally { await race.close(); }
+  }
+});
+
+test('a replacement targeting another watched Mint invalidates and reconsiders the old bucket', async () => {
+  const otherTarget = { ...target, mint: '0x' + '78'.repeat(20), token: '0x' + '89'.repeat(20) };
+  const good = await signedPending(), replacement = await signedPending({ to: otherTarget.mint, gasPrice: 140_000_000n });
+  const fallback = await signedPending({}, Wallet.createRandom());
+  const firstHead = Promise.withResolvers(), firstPlan = Promise.withResolvers();
+  let reads = 0;
+  const planned = [], submitted = [];
+  const { race, feed } = setup({ requirePreopen: true, pendingTargets: [target, otherTarget], provider: {
+    async getBlock() { if (++reads === 1) await firstHead.promise; return testHead; },
+  }, raceServices: { hasReproducibleBscEnvelope,
+    async buildPreopenBuyPlan(_p, _t, sequence) {
+      const selected = sequence.pendingHashes.at(-1);
+      planned.push(selected);
+      if (selected === good.hash) await firstPlan.promise;
+      return { ...testPlan, pendingHash: selected };
+    },
+  }, execute: {
+    async race(request) { await request.beforeSign(); request.beforeDispatch(); submitted.push(request.preopenPlan.pendingHash); return result(1, 'confirmed'); },
+    async raceStatus() { assert.fail('no unresolved order'); },
+  } });
+  try {
+    race.start();
+    feed().onTransaction(fallback);
+    feed().onTransaction(good);
+    firstHead.resolve();
+    await tick();
+    assert.deepEqual(planned, [good.hash]);
+    feed().onTransaction(replacement);
+    firstPlan.resolve();
+    await tick();
+    assert.ok(planned.includes(fallback.hash), 'the old bucket must re-check its remaining independent candidate');
+    assert.deepEqual(new Set(submitted), new Set([replacement.hash, fallback.hash]));
+    assert.ok(!submitted.includes(good.hash));
+  } finally { firstHead.resolve(); firstPlan.resolve(); await race.close(); }
+});
+
+test('a selected pending envelope that ages out during execution preparation cannot be signed', async () => {
+  const good = await signedPending();
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let now = 1000, signed = 0, rejection;
+  const { race, feed } = setup({ requirePreopen: true, provider: { getBlock: async () => testHead }, raceServices: {
+    hasReproducibleBscEnvelope, nowMs: () => now, buildPreopenBuyPlan: async () => ({ ...testPlan, pendingHash: good.hash }),
+  }, execute: {
+    async race(request) {
+      entered.resolve(); await release.promise;
+      try { await request.beforeSign(); request.beforeDispatch(); signed++; }
+      catch (error) { rejection = error.message; }
+      return result(0, 'skipped');
+    }, async raceStatus() { assert.fail('nothing was signed'); },
+  } });
+  try {
+    race.start(); feed().onTransaction(good);
+    await entered.promise;
+    now += 2501;
+    release.resolve();
+    await tick();
+    assert.equal(signed, 0);
+    assert.match(rejection ?? '', /Mint 已过期/);
+  } finally { release.resolve(); await race.close(); }
 });

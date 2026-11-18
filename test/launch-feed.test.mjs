@@ -173,6 +173,8 @@ test('allows bounded retry of a not-yet-indexed receipt and abort stops all poll
   feed.start();
   await eventually(() => seen.length === 2, 'candidate was not retried');
   assert.equal(seen[0].observedAtMs, seen[1].observedAtMs);
+  assert.ok(Number.isFinite(seen[0].observedAtMonotonicMs));
+  assert.equal(seen[0].observedAtMonotonicMs, seen[1].observedAtMonotonicMs);
   abort.abort();
   await feed.close();
   const final = scans;

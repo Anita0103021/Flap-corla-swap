@@ -155,6 +155,20 @@ test('verified receipt and pinned market reads overlap, then simulation overlaps
   assert.equal(f.sends(), 1);
 });
 
+test('elapsed timing includes feed queue delay and ignores invalid future monotonic notices', async t => {
+  const notice = Math.max(0, performance.now() - 100);
+  const f = fixture(t);
+  await f.started;
+  await f.candidate({ ...candidate, observedAtMonotonicMs: notice });
+  const sent = f.logs.find(row => row.event === 'snipe_send');
+  assert.ok(sent.elapsedMs >= 90, 'must not reset the origin when a queued candidate callback starts');
+  const future = fixture(t);
+  await future.started;
+  await future.candidate({ ...candidate, observedAtMonotonicMs: performance.now() + 60_000 });
+  const later = future.logs.find(row => row.event === 'snipe_send');
+  assert.ok(Number.isFinite(later.elapsedMs) && later.elapsedMs >= 0 && later.elapsedMs < 30_000);
+});
+
 test('candidate overlaps wallet preparation with proof and aggregated quote, retains the exact promise and one-shot guard', async t => {
   const proof = Promise.withResolvers(), quoteStarted = Promise.withResolvers(), warm = Promise.withResolvers();
   let prepareCount = 0;

@@ -6,7 +6,7 @@ import { LOW_LATENCY_RPC_TIMEOUT_MS } from '../src/rpc-config.mjs';
 import { SNIPE_RACE_WINDOW_MS } from '../src/snipe-race.mjs';
 import { MAX_SNIPE_ATTEMPTS } from '../src/snipe-limits.mjs';
 
-const uiFile = name => readFile(new URL('../ui/' + name, import.meta.url), 'utf8');
+const uiFile = async name => (await readFile(new URL('../ui/' + name, import.meta.url), 'utf8')).replace(/\r\n?/g, '\n');
 const [app, html] = await Promise.all(['app.js', 'index.html'].map(uiFile));
 
 function preview(snipeTiming = { retryWindowMs: SNIPE_RACE_WINDOW_MS, rpcTimeoutMs: LOW_LATENCY_RPC_TIMEOUT_MS,

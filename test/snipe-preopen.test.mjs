@@ -208,6 +208,20 @@ test('preopen refuses non-final, already deployed, mismatched nonce, and forged 
   }
 });
 
+test('a complete same-hash source frame repairs failed envelope reconstruction while inspection is in flight', async () => {
+  const f = await fixture();
+  let reads = 0;
+  const partial = { ...f.pending, r: undefined, s: undefined, v: undefined };
+  const plan = await f.run(() => ++reads === 1 ? [partial] : f.rows);
+  assert.equal(plan.pendingHash, f.pending.hash);
+  assert.equal(isVerifiedPreopenBuyPlan(plan), true);
+  assert.equal(f.inspections(), 1, 'repair reuses the pinned inspection instead of starting new RPC work');
+  assert.equal(f.api.length, 2);
+  const broken = await fixture();
+  await assert.rejects(broken.run([{ ...broken.pending, r: undefined }]), /签名与交易哈希/);
+  assert.equal(broken.api.length, 0, 'unrepaired input cannot reach simulation');
+});
+
 test('a mined penultimate Mint that arrives late is classified as stale, not a buy wallet funding error', async () => {
   const f = await fixture({ fakeMinterNonce: true });
   await assert.rejects(f.run(), error => error.stage === 'stale_pending' && error.evidence.stalePendingCount === 1);

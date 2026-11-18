@@ -168,7 +168,11 @@ export async function preparePreopenMintSequence(provider, target, pending, sett
   const envelopes = new Map(), accounts = new Map();
   const readEnvelope = row => {
     const id = row.hash.toLowerCase();
-    if (!envelopes.has(id)) {
+    const prior = envelopes.get(id);
+    // Failed reconstruction is a property of a source frame, not proof that
+    // the advertised hash is unusable on every source. A later complete frame
+    // arriving while inspection runs must be allowed to repair this candidate.
+    if (!prior || prior.error && prior.row !== row) {
       try {
         const mint = signedMint(row, verified, uint(row.value));
         envelopes.set(id, { mint });
@@ -179,7 +183,7 @@ export async function preparePreopenMintSequence(provider, target, pending, sett
             provider.getBalance(mint.from, at), tokenQuote ? readQuoteFunds(provider, quoteToken, mint.from, FACTORY, at) : null]);
           accounts.set(mint.from, checks.then(value => ({ value }), error => ({ error })));
         }
-      } catch (error) { envelopes.set(id, { error }); }
+      } catch (error) { envelopes.set(id, { error, row }); }
     }
     return envelopes.get(id);
   };

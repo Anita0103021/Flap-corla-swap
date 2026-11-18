@@ -10,6 +10,7 @@ import { MAX_PREOPEN_MINTS } from './snipe-limits.mjs';
 const EVENTS = new Set([
   'watch_started', 'watch_stopped', 'watch_error', 'project', 'project_error', 'rpc_error', 'journal',
   'snipe_feed', 'snipe_detected', 'snipe_pending', 'snipe_pending_match', 'snipe_pending_feed', 'snipe_pending_gate',
+  'snipe_pending_source', 'snipe_pending_source_match',
   'snipe_race_mode', 'snipe_race_attempt', 'snipe_race_outcome', 'snipe_send', 'snipe_ack',
   'snipe_receipt', 'snipe_launch_index', 'snipe_first_buy', 'buy', 'buy_skipped',
 ]);
@@ -20,7 +21,7 @@ const NUMBERS = [
   'receiptIndex', 'transactionIndex', 'scanToBlock', 'scanMs', 'windowBlocks', 'deadlineSeconds',
   'preopenLots', 'slippageBps', 'maxOpeningPremiumBps', 'maxPriceImpactBps', 'maxBuyTaxBps', 'maxSellTaxBps', 'phase',
   'pendingCandidateCount', 'pendingMintCount', 'pendingSource', 'pendingSourceCount', 'pendingHealthyCount', 'pendingFullSourceCount',
-  'stalePendingCount',
+  'stalePendingCount', 'firstBuySwapCount', 'firstBuySellCount',
   'fullMessages', 'hashMessages', 'droppedMessages', 'unrecognizedMessages', 'connections',
   'matchingPendingMessages', 'canonicalLaunches', 'matchesDuringHealthyFullFeed', 'retryMs', 'reconnects',
 ];
@@ -33,11 +34,13 @@ const QUANTITIES = [
   'amountIn', 'amountOutMin', 'quoted', 'openingNetOut', 'quotedNetOut', 'openingAmountOutMin', 'gasEstimate', 'gasUsed', 'gasLimit', 'gasPrice',
   'effectiveGasPrice', 'maxGasPriceWei', 'gasLimitCap', 'maxTotalWei', 'reserveBnb', 'reserveQuote',
   'minLiquidity', 'pricePerLot', 'mintedLots', 'totalLots', 'remainingLots', 'batches', 'raceGasCap',
+  'firstBuyTotalIn', 'firstBuyQuoteOut',
 ];
 const HASHES = ['txHash', 'launchTx', 'launchTxHash', 'pendingTxHash', 'blockHash', 'receiptBlockHash', 'parentHash'];
 const BOOLS = [
   'live', 'launched', 'receiptStable', 'preflightOverlapped', 'knownSuccess', 'matchedPending',
   'success', 'healthy', 'fullFeedHealthy', 'seenBeforeLocalConfirmation', 'afterLaunchSignal', 'submitted', 'requirePreopen',
+  'signatureVerified', 'firstBuyAggregationComplete',
 ];
 const TRANSPORT = new Set(['ws', 'http', 'pending', 'confirmed']);
 const MODE = new Set(['pending', 'confirmed', 'preopen', 'repeat', 'race', 'once', 'single', 'public', 'live']);
@@ -235,7 +238,7 @@ export async function createSnipeRunRecorder({
     if (failed || accepted >= maxEvents) { dropped++; return false; }
     try {
       const row = fieldsFor(fields, mints, tokens);
-      const time = event === 'snipe_pending' && row.pendingReceivedAtMs !== undefined
+      const time = ['snipe_pending', 'snipe_pending_source'].includes(event) && row.pendingReceivedAtMs !== undefined
         ? new Date(row.pendingReceivedAtMs).toISOString() : new Date().toISOString();
       const line = JSON.stringify({ event, sequence: accepted + 1, time,
         runMs: round(performance.now() - began), ...row }) + '\n';
@@ -300,7 +303,7 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
       // Only verified quote-in / target-out swaps count as buys.
       const quoteFirst = low(asset) < low(fields.token);
       const launchLogIndex = rpcInt(launchLog.index ?? launchLog.logIndex);
-      const buys = [];
+      const buys = [], legs = [], logIds = new Map();
       for (const swap of swaps) {
         const block = rpcInt(swap.blockNumber);
         const txIndex = rpcInt(swap.transactionIndex);
@@ -313,8 +316,22 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
         try {
           const row = PAIR_EVENTS.parseLog(swap)?.args;
           if (!row) continue;
+          if (logIndex !== undefined) {
+            const id = `${low(swap.blockHash)}:${logIndex}`;
+            const fingerprint = `${low(swap.transactionHash)}:${txIndex}:${low(swap.data)}:${JSON.stringify(swap.topics)}`;
+            if (logIds.has(id)) {
+              if (logIds.get(id) !== fingerprint) return; // conflicting source evidence is not a comparison
+              continue;
+            }
+            logIds.set(id, fingerprint);
+          }
           const amountIn = quoteFirst ? row.amount0In : row.amount1In;
           const targetOut = quoteFirst ? row.amount1Out : row.amount0Out;
+          const quoteOut = quoteFirst ? row.amount0Out : row.amount1Out;
+          const targetIn = quoteFirst ? row.amount1In : row.amount0In;
+          legs.push({ block, txIndex, logIndex, hash: swap.transactionHash, blockHash: swap.blockHash,
+            amountIn: amountIn > 0n && targetOut > 0n ? amountIn : 0n,
+            quoteOut: quoteOut > 0n && targetIn > 0n ? quoteOut : 0n });
           if (amountIn > 0n && targetOut > 0n) buys.push({ block, txIndex, logIndex, amountIn, swap });
         } catch { /* Discard malformed event data. */ }
       }
@@ -329,9 +346,58 @@ export function createSnipeReceiptObserver({ provider, record, signal, launchDel
       if (!first) { record('snipe_first_buy', { ...context, status: 'no_buy_seen' }); return; }
       const inclusion = first.block === height ? canonicalLaunch : canonicalBuy;
       if (rpcInt(inclusion?.number) !== first.block || !same(first.swap.blockHash, inclusion?.hash)) return;
+      // A single top-level transaction can probe-buy, sell, and then buy much
+      // more. Preserve amountIn (first Swap) for old consumers, and explicitly
+      // report all buy/sell quote legs in this exact transaction and pool.
+      let compound = [], complete = false;
+      // getLogs can omit a Swap even when every returned item has an index.
+      // Claim a full transaction total only from a matching successful receipt,
+      // and require every already-observed leg to be present in that receipt.
+      try {
+        const receipt = await provider.getTransactionReceipt(first.swap.transactionHash);
+        if (!active()) return;
+        if (same(receipt?.hash ?? receipt?.transactionHash, first.swap.transactionHash) && rpcInt(receipt.status) === 1 &&
+            rpcInt(receipt.blockNumber) === first.block && rpcInt(receipt.index ?? receipt.transactionIndex) === first.txIndex &&
+            same(receipt.blockHash, inclusion.hash) && Array.isArray(receipt.logs) && receipt.logs.length <= 2048) {
+          const identities = new Map();
+          let valid = true;
+          for (const log of receipt.logs) {
+            if (!same(log.address, pool) || !same(log.topics?.[0], SWAP_TOPIC)) continue;
+            const index = rpcInt(log.index ?? log.logIndex);
+            if (log.removed || index === undefined ||
+                (log.transactionHash !== undefined && !same(log.transactionHash, first.swap.transactionHash)) ||
+                (log.blockHash !== undefined && !same(log.blockHash, inclusion.hash)) ||
+                (log.transactionIndex !== undefined && rpcInt(log.transactionIndex) !== first.txIndex)) { valid = false; break; }
+            const fingerprint = `${low(log.data)}:${JSON.stringify(log.topics)}`;
+            if (identities.has(index)) {
+              if (identities.get(index) !== fingerprint) valid = false;
+              continue;
+            }
+            identities.set(index, fingerprint);
+            const amounts = PAIR_EVENTS.parseLog(log)?.args;
+            if (!amounts) { valid = false; break; }
+            const amountIn = quoteFirst ? amounts.amount0In : amounts.amount1In;
+            const tokenOut = quoteFirst ? amounts.amount1Out : amounts.amount0Out;
+            const quoteOut = quoteFirst ? amounts.amount0Out : amounts.amount1Out;
+            const tokenIn = quoteFirst ? amounts.amount1In : amounts.amount0In;
+            compound.push({ logIndex: index, amountIn: amountIn > 0n && tokenOut > 0n ? amountIn : 0n,
+              quoteOut: quoteOut > 0n && tokenIn > 0n ? quoteOut : 0n });
+          }
+          const observed = legs.filter(leg => leg.block === first.block && leg.txIndex === first.txIndex &&
+            same(leg.hash, first.swap.transactionHash) && same(leg.blockHash, first.swap.blockHash));
+          complete = valid && compound.some(leg => leg.amountIn > 0n) && observed.every(leg =>
+            leg.logIndex !== undefined && compound.some(found => found.logIndex === leg.logIndex &&
+              found.amountIn === leg.amountIn && found.quoteOut === leg.quoteOut));
+        }
+      } catch { /* preserve the observed first-buy identity, but do not claim a complete total */ }
       record('snipe_first_buy', { ...context, status: 'mined', knownSuccess: true,
         txHash: first.swap.transactionHash, receiptBlock: first.block, receiptIndex: first.txIndex,
-        receiptBlockHash: first.swap.blockHash, blockOffset: first.block - height, amountIn: first.amountIn });
+        receiptBlockHash: first.swap.blockHash, blockOffset: first.block - height, amountIn: first.amountIn,
+        firstBuyAggregationComplete: complete,
+        ...(complete ? { firstBuyTotalIn: compound.reduce((sum, leg) => sum + leg.amountIn, 0n),
+          firstBuyQuoteOut: compound.reduce((sum, leg) => sum + leg.quoteOut, 0n),
+          firstBuySwapCount: compound.filter(leg => leg.amountIn > 0n).length,
+          firstBuySellCount: compound.filter(leg => leg.quoteOut > 0n).length } : {}) });
     } catch { /* Optional comparison never affects the job or delays stop. */ }
     finally { comparisons--; }
   }

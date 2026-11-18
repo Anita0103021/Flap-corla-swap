@@ -123,7 +123,8 @@ export function makeLaunchFeed({
     if (candidate.removed) {
       if (prior?.status === 'removed' || (!prior && !room())) return;
       queued.delete(key);
-      const removed = { ...candidate, source, observedAtMs: prior?.candidate.observedAtMs ?? Date.now() };
+      const removed = { ...candidate, source, observedAtMs: prior?.candidate.observedAtMs ?? Date.now(),
+        observedAtMonotonicMs: prior?.candidate.observedAtMonotonicMs ?? performance.now() };
       if (prior) prior.status = 'removed';
       else records.set(key, { candidate: removed, status: 'removed' });
       try { Promise.resolve(onRemoved?.(removed)).catch(() => {}); } catch { /* final chain check remains mandatory */ }
@@ -139,6 +140,7 @@ export function makeLaunchFeed({
     record.status = 'queued';
     record.candidate = {
       ...candidate, source, observedAtMs: prior?.candidate.observedAtMs ?? Date.now(),
+      observedAtMonotonicMs: prior?.candidate.observedAtMonotonicMs ?? performance.now(),
     };
     records.set(key, record);
     queued.set(key, record);

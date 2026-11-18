@@ -372,7 +372,10 @@ export function makeFastSnipe({ provider, watchProvider = provider, settings, pr
     const key = lower(target.mint);
     if (attempted.has(key)) return;
     if (inFlight.has(key)) return false;
-    const arrival = race.noteLaunchSignal(candidate, performance.now());
+    const now = performance.now();
+    const received = candidate.observedAtMonotonicMs;
+    const arrival = race.noteLaunchSignal(candidate,
+      Number.isFinite(received) && received >= 0 && received <= now ? received : now);
     const seen = arrival.seen;
     const quoteTelemetry = {};
     if (arrival.first) log('snipe_detected', { mint: target.mint, token: target.token, signalSource: arrival.source,

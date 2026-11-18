@@ -99,6 +99,27 @@ test('the report keeps final-batch progress, hashes and WSS source without retai
   assert.ok(!JSON.stringify([ready, pending, invalid]).includes(KEY));
 });
 
+test('per-source timing records preserve signed late arrivals and compound first-buy amounts but not secrets', async t => {
+  const rootDir = await sandbox(t);
+  const recorder = await createSnipeRunRecorder({ rootDir, targets: [target] });
+  recorder.record('snipe_pending_source', { mint: MINT, token: TOKEN, pendingSource: 2,
+    pendingTxHash: TX, pendingReceivedAtMs: 1_794_626_238_617, signatureVerified: true, rpcUrl: RPC, raw: KEY });
+  recorder.record('snipe_pending_source_match', { mint: MINT, token: TOKEN, pendingSource: 2,
+    launchTx: TX, leadMs: -459, signatureVerified: true, matchedPending: false, wallet: WALLET });
+  recorder.record('snipe_pending_source_match', { pendingSource: 3, leadMs: null, signatureVerified: false });
+  recorder.record('snipe_first_buy', { mint: MINT, token: TOKEN, txHash: TX, amountIn: 1n,
+    firstBuyTotalIn: 20000n, firstBuyQuoteOut: 1n, firstBuySwapCount: 2, firstBuySellCount: 1 });
+  await recorder.close();
+  const [, first, late, unseen, buy] = await load(rootDir, recorder.fileName);
+  assert.equal(first.time, new Date(1_794_626_238_617).toISOString());
+  assert.equal(first.signatureVerified, true);
+  assert.equal(late.leadMs, -459);
+  assert.equal(unseen.leadMs, null);
+  assert.deepEqual([buy.amountIn, buy.firstBuyTotalIn, buy.firstBuyQuoteOut, buy.firstBuySwapCount, buy.firstBuySellCount],
+    ['1', '20000', '1', 2, 1]);
+  for (const secret of [RPC, KEY, WALLET]) assert.ok(!JSON.stringify([first, late, unseen, buy]).includes(secret));
+});
+
 test('per-run file names are unique and report queue caps are explicit', async t => {
   const rootDir = await sandbox(t);
   const first = await createSnipeRunRecorder({ rootDir, targets: [target], armBlock: 41, maxEvents: 2 });
@@ -177,7 +198,8 @@ test('delayed first-buy comparison sorts by block and index, ignores sells, and 
   const sell = '0x' + '5a'.repeat(32), laterBuy = '0x' + '5b'.repeat(32);
   const abi = new Interface(['event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)']);
   const log = (hash, blockNumber, transactionIndex, amounts) => ({
-    address: pool, transactionHash: hash, blockNumber, transactionIndex, blockHash: blockNumber === 42 ? BLOCK : next,
+    address: pool, transactionHash: hash, blockNumber, transactionIndex,
+    index: transactionIndex * 10 + Number(amounts[1] || amounts[0]), blockHash: blockNumber === 42 ? BLOCK : next,
     ...abi.encodeEventLog('Swap', [MINT, ...amounts, TOKEN]),
   });
   const topic = addr => '0x' + '0'.repeat(24) + addr.slice(2);
@@ -188,6 +210,10 @@ test('delayed first-buy comparison sorts by block and index, ignores sells, and 
       async getBlock(height) { return { number: height, hash: height === 42 ? BLOCK : next }; },
       async getBlockNumber() { return 44; },
       async getTransactionReceipt(hash) {
+        if (hash === TX) return { hash, status: 1, index: 84, blockNumber: 42, blockHash: BLOCK,
+          // The receipt has a buy leg omitted by the range-query response.
+          logs: [log(TX, 42, 84, [0n, 150n, 70n, 0n]), log(TX, 42, 84, [50n, 0n, 0n, 20n]),
+            log(TX, 42, 84, [0n, 200n, 90n, 0n]), log(TX, 42, 84, [0n, 300n, 90n, 0n])] };
         return { hash, status: 1, index: 82, blockNumber: 42, blockHash: BLOCK,
           logs: [{ address: MINT, topics: [CORLA_LAUNCH_TOPIC, topic(TOKEN), topic(pool)] }] };
       },
@@ -198,6 +224,10 @@ test('delayed first-buy comparison sorts by block and index, ignores sells, and 
           log(laterBuy, 43, 1, [0n, 100n, 50n, 0n]),
           log(sell, 42, 83, [100n, 0n, 0n, 50n]),
           log(TX, 42, 84, [0n, 150n, 70n, 0n]),
+          log(TX, 42, 84, [50n, 0n, 0n, 20n]),
+          log(TX, 42, 84, [0n, 200n, 90n, 0n]),
+          log(TX, 42, 84, [0n, 200n, 90n, 0n]), // duplicate log is counted once
+          log(TX, 42, 85, [0n, 99999n, 90n, 0n]), // inconsistent inclusion cannot inflate the compound amount
         ];
       },
     },
@@ -210,6 +240,11 @@ test('delayed first-buy comparison sorts by block and index, ignores sells, and 
     assert.equal(rows[1][1].receiptIndex, 84);
     assert.equal(rows[1][1].blockOffset, 0);
     assert.equal(rows[1][1].amountIn, 150n);
+    assert.equal(rows[1][1].firstBuyTotalIn, 650n);
+    assert.equal(rows[1][1].firstBuyQuoteOut, 20n);
+    assert.equal(rows[1][1].firstBuySwapCount, 3);
+    assert.equal(rows[1][1].firstBuySellCount, 1);
+    assert.equal(rows[1][1].firstBuyAggregationComplete, true);
     observer.observe('snipe_detected', { mint: MINT, token: TOKEN, pool, launchBlock: 42, launchTx: secondLaunch });
     for (let i = 0; i < 40 && rows.length < 4; i++) await delay(10);
     assert.equal(rows[3][0], 'snipe_first_buy');

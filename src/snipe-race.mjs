@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { createHash } from 'node:crypto';
 import { actionId, shortError } from './monitor.mjs';
 import { decodePendingMint, makePendingTransactionFeed, pendingWsSources } from './pending-mint-shadow.mjs';
 import { buildPreopenBuyPlan, preparePreopenMintSequence, PreopenMintWait } from './snipe-preopen.mjs';
@@ -6,6 +7,7 @@ import { MAX_PREOPEN_CANDIDATES } from './snipe-limits.mjs';
 import { snipeSettingsForTarget } from './config.mjs';
 import { ROUTER } from './market.mjs';
 import { readQuoteDecimals, requireQuoteFunds } from './quote-assets.mjs';
+import { hasReproducibleBscEnvelope } from './snipe-pending-compare.mjs';
 
 const lower = x => typeof x === 'string' ? x.toLowerCase() : '';
 const nowMs = () => performance.now();
@@ -15,12 +17,31 @@ const QUEUED_PENDING_MAX_AGE_MS = 2_500;
 export const SNIPE_RACE_WINDOW_MS = 4_800;
 const key = (target, wallet) => lower(target.mint) + ':' + lower(wallet.address);
 const candidateKey = (mint, hash) => lower(mint) + ':' + lower(hash);
+const nonceKey = tx => {
+  try {
+    if (typeof tx?.from !== 'string' || typeof tx.nonce !== 'string' || !/^0x[0-9a-f]{1,14}$/i.test(tx.nonce)) return;
+    const nonce = Number(BigInt(tx.nonce));
+    if (Number.isSafeInteger(nonce)) return lower(tx.from) + ':' + nonce;
+  } catch { /* malformed source frame */ }
+};
+const ENVELOPE_FIELDS = [
+  'hash', 'from', 'to', 'input', 'data', 'type', 'nonce', 'gas', 'value', 'gasPrice', 'maxFeePerGas',
+  'maxPriorityFeePerGas', 'r', 's', 'v', 'yParity', 'chainId', 'blockHash', 'blockNumber', 'transactionIndex',
+];
+const envelopeFingerprint = tx => createHash('sha256').update(JSON.stringify([
+  ...ENVELOPE_FIELDS.map(field => tx[field]), tx.accessList,
+])).digest('hex');
+const snapshot = tx => Object.freeze(Object.fromEntries(
+  ENVELOPE_FIELDS.filter(field => tx[field] !== undefined).map(field => [field, tx[field]]).concat(tx.accessList === undefined ? [] :
+  [['accessList', Object.freeze(tx.accessList.map(row => Object.freeze({ address: row.address,
+    storageKeys: Object.freeze([...row.storageKeys]) })))]])));
 
 // The confirmed and pending paths share an in-process owner as well as the
 // executor's cross-process journal. Never let a confirmed quote replace the
 // original price floor after a speculative sequence has started.
 export function makeSnipeRace({ provider, prepared, settings, execute, signal, log, services = {} }) {
-  const svc = { buildPreopenBuyPlan, preparePreopenMintSequence, makePendingTransactionFeed, delay, nowMs, ...services };
+  const svc = { buildPreopenBuyPlan, preparePreopenMintSequence, makePendingTransactionFeed,
+    hasReproducibleBscEnvelope, delay, nowMs, ...services };
   const maxAttempts = settings.repeatAttempts ?? 1;
   const enabled = maxAttempts > 1;
   if (settings.requirePreopen && !enabled) throw new Error('只走提前狙击需要限次竞争模式');
@@ -31,6 +52,7 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
   const pendingReceipts = new Map(), activeSeries = new Set();
   const confirmedMints = new Set();
   const launchSignals = new Map(), firstLaunchSignals = new Map();
+  const nonceHeads = new Map(), confirmedNotices = new Map();
   const targets = new Map((prepared.pendingTargets ?? []).map(t => [lower(t.mint), t]));
   const feeds = new Map(), pendingStates = new Map();
   let closed = false, pendingStarted = false, receiptTimer, receiptCheck;
@@ -82,6 +104,22 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
     if (targets.has(mint)) drainPending(targets.get(mint), mint);
   }
 
+  function sourceMatch(notice, source, at) {
+    const signed = at?.signed;
+    const lead = signed ? notice.seen - signed.seen : null;
+    const signatureVerified = Boolean(signed);
+    // A late upgrade is a new measurement, not a second opening opportunity.
+    const previous = notice.recorded.get(source);
+    if (previous === signatureVerified) return;
+    notice.recorded.set(source, signatureVerified);
+    const { candidate } = notice;
+    log('snipe_pending_source_match', { mint: candidate.mint, token: candidate.token,
+      launchTx: candidate.txHash, launchBlock: candidate.blockNumber, pendingSource: source,
+      signatureVerified, matchedPending: signatureVerified && lead >= 0,
+      seenBeforeLocalConfirmation: signatureVerified && lead >= 0, leadMs: lead,
+      ...(signed ? { pendingReceivedAtMs: signed.receivedAtMs } : {}) });
+  }
+
   function noteConfirmed(candidate, seen) {
     const mint = lower(candidate.mint);
     confirmedMints.add(mint);
@@ -91,8 +129,12 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
     const id = candidateKey(candidate.mint, candidate.txHash);
     if (measured.has(id) || measured.size >= 256) return;
     measured.add(id);
-    const at = candidateTimes.get(id);
+    const entry = candidateTimes.get(id);
+    const at = entry?.signed;
     const first = firstLaunchSignals.get(launchKey(candidate)) ?? { seen, source: candidate.source };
+    const notice = { candidate, seen: first.seen, recorded: new Map() };
+    confirmedNotices.set(id, notice);
+    for (const source of pendingStates.keys()) sourceMatch(notice, source, entry?.sources.get(source));
     const match = at && first.seen >= at.seen;
     log('snipe_pending_match', { mint: candidate.mint, token: candidate.token, launchTx: candidate.txHash,
       launchBlock: candidate.blockNumber, source: first.source, ...(first.pending ?? pendingEvidence()), matchedPending: Boolean(match),
@@ -192,9 +234,19 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
     const headMs = Math.round(svc.nowMs() - headAt);
     if (ended() || paused(mint) || !head || head.number < prepared.armBlock) return;
     let sequence;
+    let selected;
+    const checkSelected = () => {
+      const now = svc.nowMs();
+      if (!selected || selected.length !== sequence.pendingHashes.length) throw new Error('待打包 Mint 选中序列已失效；未发送');
+      if (selected.some(row => now - row.seen > QUEUED_PENDING_MAX_AGE_MS)) throw new Error('待打包 Mint 已过期；未发送');
+      if (selected.some(row => row.nonceKey && nonceHeads.get(row.nonceKey)?.hash !== lower(row.tx.hash))) {
+        throw new Error('待打包 Mint 的 nonce 已被新签名交易替换；未发送');
+      }
+    };
     const candidates = () => {
       const now = svc.nowMs();
-      return bucket.items.filter(row => now - row.seen <= QUEUED_PENDING_MAX_AGE_MS).map(row => row.tx);
+      return bucket.items.filter(row => now - row.seen <= QUEUED_PENDING_MAX_AGE_MS &&
+        (!row.nonceKey || nonceHeads.get(row.nonceKey)?.hash === lower(row.tx.hash))).map(row => row.tx);
     };
     const proofAt = svc.nowMs();
     try { sequence = await svc.preparePreopenMintSequence(provider, target, candidates, trade, head, { signal }); }
@@ -210,8 +262,14 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
     }
     if (ended() || paused(mint)) return;
     const pendingHashes = sequence.pendingHashes;
+    selected = pendingHashes.map(hash => bucket.items.find(row => lower(row.tx.hash) === lower(hash))).filter(Boolean);
+    try { checkSelected(); } catch (error) {
+      log('buy_skipped', { mint: target.mint, token: target.token, raceMode: 'pending',
+        quoteBlock: head.number, error: shortError(error) });
+      return;
+    }
     const pendingTxHash = pendingHashes.at(-1);
-    const seen = Math.max(...pendingHashes.map(hash => candidateTimes.get(candidateKey(mint, hash))?.seen ?? proofAt));
+    const seen = Math.max(...pendingHashes.map(hash => candidateTimes.get(candidateKey(mint, hash))?.signed?.seen ?? proofAt));
     const timing = { headMs, proofMs: Math.round(svc.nowMs() - proofAt) };
     const evidence = { quoteBlock: sequence.quoteBlock, mintedLots: sequence.mintedLots, totalLots: sequence.totalLots,
       remainingLots: sequence.remainingLots, pendingCandidateCount: sequence.pendingCandidateCount, pendingMintCount: pendingHashes.length,
@@ -229,6 +287,11 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
         return;
       }
       if (ended() || paused(mint) || owners.has(id)) return;
+      try { checkSelected(); } catch (error) {
+        log('buy_skipped', { mint: target.mint, token: target.token, raceMode: 'pending',
+          ...timing, ...evidence, error: shortError(error) });
+        return;
+      }
       owners.set(id, 'pending');
       const details = { ...evidence, ...timing, planMs: Math.round(svc.nowMs() - planAt),
         pendingTxHash: plan.pendingHash ?? pendingTxHash, quoteBlock: plan.quoteBlock,
@@ -238,7 +301,7 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
         gasEstimate: plan.gasEstimate, quoteMs: Math.round(svc.nowMs() - seen) };
       log('snipe_race_mode', { ...details, mint: target.mint, token: target.token, raceMode: 'pending', maxAttempts });
       try {
-        await series({ target, wallet, raceMode: 'pending', details, checkOpening, request: {
+        await series({ target, wallet, raceMode: 'pending', details, checkOpening: () => { checkOpening(); checkSelected(); }, request: {
           actionId: actionId('buy', target), wallet, tx: plan.tx, gasEstimate: plan.gasEstimate, preopenPlan: plan,
           quoteToken: trade.quoteToken,
           beforeSign: async () => {
@@ -248,9 +311,20 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
                 latest.number < plan.quoteBlock || latest.number - plan.quoteBlock > PREOPEN_BLOCKS ||
                 latest.timestamp + 2 >= plan.deadline) throw new Error('提前发单的模拟区块已过期或重组；未发送');
             if (latest.number > plan.quoteBlock) {
+              const senderNonces = new Map();
+              for (const row of selected) if (row.nonceKey) {
+                const sender = lower(row.tx.from), nonce = Number(BigInt(row.tx.nonce));
+                senderNonces.set(sender, Math.min(senderNonces.get(sender) ?? nonce, nonce));
+              }
+              const [freshNonces, code] = await Promise.all([
+                Promise.all([...senderNonces].map(async ([sender, expected]) => {
+                  const nonce = await provider.getTransactionCount(sender, latest.number);
+                  return Number.isSafeInteger(nonce) && nonce === expected;
+                })), provider.getCode(target.token, latest.number),
+              ]);
+              if (freshNonces.some(valid => !valid)) throw new Error('待打包 Mint 的 nonce 已在新父块变化；未发送');
               // A pool already created in a newer block must satisfy the
               // original minOut at that state. Never chase by re-quoting.
-              const code = await provider.getCode(target.token, latest.number);
               if (code !== '0x') {
                 if (settings.requirePreopen) skipAfterLaunch();
                 await provider.call({ ...plan.tx, from: wallet.address, blockTag: latest.number });
@@ -300,28 +374,81 @@ export function makeSnipeRace({ provider, prepared, settings, execute, signal, l
 
   function onPending(tx, arrival, source) {
     if (ended()) return;
-    const seen = Number.isFinite(arrival?.seen) ? arrival.seen : svc.nowMs();
+    const now = svc.nowMs();
+    const seen = Number.isFinite(arrival?.seen) && arrival.seen >= 0 && arrival.seen <= now ? arrival.seen : now;
     const receivedAtMs = Number.isSafeInteger(arrival?.receivedAtMs) ? arrival.receivedAtMs : Date.now();
+    const replaceNonce = (senderNonce, hash, excludeMint) => {
+      if (!nonceHeads.has(senderNonce) && nonceHeads.size >= 512) nonceHeads.delete(nonceHeads.keys().next().value);
+      nonceHeads.set(senderNonce, { hash, seen });
+      for (const [mint, bucket] of queued) if (mint !== excludeMint &&
+          bucket.items.some(row => row.nonceKey === senderNonce && lower(row.tx.hash) !== hash)) {
+        bucket.version++;
+        drainPending(targets.get(mint), mint);
+      }
+    };
     const match = decodePendingMint(tx, targets);
-    if (!match) return;
+    if (!match) {
+      // Only inspect non-Mint traffic for sender/nonce pairs we already use.
+      // A valid self-transfer/cancel can replace the selected Mint just as a
+      // newer Mint can. Never do signature recovery for unrelated mempool txs.
+      const senderNonce = nonceKey(tx), previous = senderNonce && nonceHeads.get(senderNonce);
+      if (!previous || previous.hash === lower(tx.hash) || !svc.hasReproducibleBscEnvelope(tx)) return;
+      replaceNonce(senderNonce, lower(tx.hash));
+      return;
+    }
     const target = targets.get(lower(match.mint));
     const id = candidateKey(match.mint, match.hash);
-    if (candidateTimes.has(id)) return;
-    if (candidateTimes.size >= 512) candidateTimes.delete(candidateTimes.keys().next().value);
-    // Done before inspecting the parent, simulating or submitting an order.
     const frameMode = arrival?.mode === 'full' || arrival?.mode === 'mixed' ? arrival.mode : pendingStates.get(source)?.mode;
-    candidateTimes.set(id, { seen, receivedAtMs, mode: frameMode, source });
     const mint = lower(target.mint);
-    log('snipe_pending', { mint: target.mint, token: target.token, pendingTxHash: match.hash, pendingMode: frameMode,
-      pendingReceivedAtMs: receivedAtMs, pendingSource: source,
-      afterLaunchSignal: confirmedMints.has(mint) || launchSignals.has(mint) });
+    const meta = { seen, receivedAtMs, mode: frameMode, source };
+    let entry = candidateTimes.get(id);
+    if (!entry) {
+      if (candidateTimes.size >= 512) candidateTimes.delete(candidateTimes.keys().next().value);
+      entry = { ...meta, sources: new Map() };
+      candidateTimes.set(id, entry);
+      log('snipe_pending', { mint: target.mint, token: target.token, pendingTxHash: match.hash, pendingMode: frameMode,
+        pendingReceivedAtMs: receivedAtMs, pendingSource: source,
+        afterLaunchSignal: confirmedMints.has(mint) || launchSignals.has(mint) });
+    }
+    let sourceAt = entry.sources.get(source);
+    if (sourceAt?.signed) return;
+    const fingerprint = envelopeFingerprint(tx);
+    if (sourceAt?.checkedFingerprint === fingerprint) return;
+    const verified = entry.verifiedFingerprint === fingerprint || svc.hasReproducibleBscEnvelope(tx);
+    const firstAtSource = !sourceAt;
+    if (!sourceAt) { sourceAt = { first: meta }; entry.sources.set(source, sourceAt); }
+    sourceAt.checkedFingerprint = fingerprint;
+    if (verified) entry.verifiedFingerprint = fingerprint;
+    if (verified) sourceAt.signed = meta;
+    if (firstAtSource || verified) {
+      log('snipe_pending_source', { mint: target.mint, token: target.token, pendingTxHash: match.hash,
+        pendingMode: frameMode, pendingReceivedAtMs: receivedAtMs, pendingSource: source, signatureVerified: verified,
+        afterLaunchSignal: confirmedMints.has(mint) || launchSignals.has(mint) });
+    }
+    const notice = confirmedNotices.get(id);
+    if (notice) sourceMatch(notice, source, sourceAt);
+    if (!verified) {
+      // An incomplete first source is not allowed to poison the hash for a
+      // later full envelope. A visibly signed but forged frame is diagnostic.
+      if (!entry.signatureFailureReported && tx.r && tx.s) {
+        entry.signatureFailureReported = true;
+        log('buy_skipped', { mint: target.mint, token: target.token, pendingTxHash: match.hash,
+          raceMode: 'pending', error: '无法核验待打包 Mint 的 BSC 签名与交易哈希' });
+      }
+      return;
+    }
+    if (entry.signed) return;
+    entry.signed = meta;
     if (!enabled || confirmedMints.has(mint) ||
         prepared.wallets.every(wallet => owners.has(key(target, wallet)))) return;
+    const senderNonce = nonceKey(tx);
+    if (senderNonce) replaceNonce(senderNonce, match.hash, mint);
     // Keep the bounded group even while proof reads are in flight. Multiple
     // consecutive Mint calls can fill and open in a single block.
     const bucket = queued.get(mint) ?? { items: [], version: 0, considered: 0 };
+    if (senderNonce) bucket.items = bucket.items.filter(row => row.nonceKey !== senderNonce);
     while (bucket.items.length >= MAX_PREOPEN_CANDIDATES) bucket.items.shift();
-    bucket.items.push({ tx, seen });
+    bucket.items.push({ tx: snapshot(tx), seen, nonceKey: senderNonce });
     bucket.version++;
     queued.set(mint, bucket);
     drainPending(target, mint);
