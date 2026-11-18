@@ -108,6 +108,13 @@ function launchSeed(result, target, minter, totalLots, asset) {
     reserveToken: quoteFirst ? sync.reserve1 : sync.reserve0 };
 }
 
+// Read-only evidence parsing shared with the hypothetical-launch first-buy
+// planner. This does not mint, sign, brand a public preopen plan, or prove that
+// the hypothetical sender will actually submit the last transaction.
+export function verifySimulatedCorlaLaunch(result, target, minter, totalLots, asset) {
+  return Object.freeze(launchSeed(result, target, minter, totalLots, asset));
+}
+
 function checkedHead(head) {
   return head && Number.isSafeInteger(head.number) && head.number >= 0 && hash(head.hash) &&
     Number.isSafeInteger(head.timestamp) && head.timestamp > 0;

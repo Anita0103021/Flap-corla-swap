@@ -120,6 +120,22 @@ test('per-source timing records preserve signed late arrivals and compound first
   for (const secret of [RPC, KEY, WALLET]) assert.ok(!JSON.stringify([first, late, unseen, buy]).includes(secret));
 });
 
+test('guarded first-buy records keep fixed diagnostics and never equate transaction success with a purchase', async t => {
+  const rootDir = await sandbox(t);
+  const recorder = await createSnipeRunRecorder({ rootDir, targets: [target] });
+  recorder.record('firstbuy_send', { mint: MINT, token: TOKEN, txHash: TX, attempt: 1,
+    intentId: BLOCK, gasReserved: 70000000n, wallet: WALLET, raw: KEY });
+  recorder.record('firstbuy_receipt', { txHash: TX, status: 'miss', confirmations: 1, bought: false });
+  recorder.record('firstbuy_paused', { code: 'FIRSTBUY_NONCE_ROLLBACK', error: RPC, wallet: WALLET });
+  recorder.record('firstbuy_paused', { code: KEY, reason: RPC });
+  await recorder.close();
+  const [,send,miss,paused,untrusted] = await load(rootDir,recorder.fileName);
+  assert.equal(send.intentId,BLOCK);assert.equal(send.gasReserved,'70000000');
+  assert.equal(miss.status,'miss');assert.equal(miss.bought,false);assert.equal(miss.confirmations,1);
+  assert.equal(paused.code,'FIRSTBUY_NONCE_ROLLBACK');assert.equal(untrusted.code,undefined);
+  for(const secret of [KEY,WALLET,RPC])assert.ok(!JSON.stringify([send,miss,paused,untrusted]).includes(secret));
+});
+
 test('per-run file names are unique and report queue caps are explicit', async t => {
   const rootDir = await sandbox(t);
   const first = await createSnipeRunRecorder({ rootDir, targets: [target], armBlock: 41, maxEvents: 2 });

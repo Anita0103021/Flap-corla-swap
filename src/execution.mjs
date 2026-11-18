@@ -247,6 +247,14 @@ function openJournal(path) {
         // network access occurs under the SQLite write lock.
         db.exec('BEGIN IMMEDIATE');
         try {
+          // First-buy sessions keep their single nonce lane reserved between
+          // known failed attempts as well as while a transaction is pending.
+          // Look up the optional table dynamically: another process can open a
+          // first-buy session after this legacy executor was constructed.
+          if (db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='firstbuy_wallet_leases'").get() &&
+              db.prepare('SELECT 1 FROM firstbuy_wallet_leases WHERE wallet=?').get(wallet)) {
+            throw new Error('Wallet is reserved by the first-buy workspace; no transaction was broadcast');
+          }
           if (refused.get(wallet, actionId)) {
             db.exec('COMMIT');
             return { refused: true };
@@ -302,13 +310,17 @@ function openJournal(path) {
   }
 }
 
-function checkRequest(tx) {
+function checkRequest(tx, allowContractCreation = false) {
   if (!tx || typeof tx !== 'object') throw new Error('Transaction is missing');
-  const to = getAddress(tx.to);
+  const creation = tx.to == null;
+  if (creation && !allowContractCreation) throw new Error('Contract creation is not enabled for this executor');
+  const to = creation ? null : getAddress(tx.to);
   if (to === ZeroAddress) throw new Error('Transaction cannot target the zero address');
   const data = tx.data;
   if (!isHexString(data, true) || data.length < 10) throw new Error('Invalid contract call data');
-  return { to, data: data.toLowerCase(), value: uint(tx.value ?? 0n, 'Transaction value') };
+  const value = uint(tx.value ?? 0n, 'Transaction value');
+  if (creation && (value !== 0n || data.length > 98_306)) throw new Error('Contract creation requires zero value and bounded initcode');
+  return { to, data: data.toLowerCase(), value };
 }
 
 function parseRaceBuy(call, address, payment) {
@@ -401,10 +413,12 @@ function blockHashAt(block, height) {
 export function makeExecutor({
   provider, wallets, live = false, maxGasPriceWei, gasLimitCap, journalPath,
   confirmations = 1, receiptTimeoutMs = 12_000, directBroadcast = false, broadcastConcurrency = 1, signal,
+  allowContractCreation = false,
 }) {
   const gasPriceCap = uint(maxGasPriceWei, 'Gas price cap', 1n);
   const gasCap = uint(gasLimitCap, 'Gas limit cap', 21_000n);
   if (typeof live !== 'boolean') throw new Error('live must be a boolean');
+  if (typeof allowContractCreation !== 'boolean') throw new Error('allowContractCreation must be a boolean');
   if (!Number.isSafeInteger(broadcastConcurrency) || broadcastConcurrency < 1 ||
       broadcastConcurrency > MAX_BROADCAST_CONCURRENCY || (broadcastConcurrency > 1 && !directBroadcast)) {
     throw new Error('Invalid broadcast concurrency for executor');
@@ -625,7 +639,7 @@ export function makeExecutor({
           }
         }
       }
-      const call = { ...checkRequest(tx), from: address };
+      const call = { ...checkRequest(tx, allowContractCreation), from: address };
       const preopenEstimate = race?.gasEstimate;
       if (preopenEstimate !== undefined) requirePreopenBuy(call, address, beforeSign, preopenEstimate, race.preopenPlan, race.base, race.intent);
       const floor = gasLimitFloor === undefined ? 0n : uint(gasLimitFloor, 'Gas limit floor', 1n);

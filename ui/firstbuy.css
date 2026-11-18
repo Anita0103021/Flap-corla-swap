@@ -1,0 +1,27 @@
+.firstbuy-panel { margin-block: 16px; }
+.firstbuy-strategy-switch { margin-block: 16px; }
+.firstbuy-strategy-switch .field { max-width: 460px; }
+#snipe-strategy-mode, .firstbuy-panel .field select { width: 100%; min-height: 41px; min-width: 0; padding: 8px 11px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--inset); color: var(--text); font: inherit; }
+#snipe-strategy-mode:focus, .firstbuy-panel .field select:focus { outline: 2px solid var(--violet); outline-offset: 2px; }
+#snipe-strategy-mode:disabled { cursor: not-allowed; opacity: .65; }
+#view-snipe[data-strategy="guarded"] .workspace-grid { grid-template-columns: minmax(0,1fr); }
+.firstbuy-panel .panel-heading > div { min-width: 0; }
+.firstbuy-panel .stats dd { max-width: 72%; overflow-wrap: anywhere; }
+.firstbuy-panel .firstbuy-report { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; }
+.firstbuy-panel fieldset { border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-block: 14px; }
+.firstbuy-panel legend { color: var(--muted); font-size: 13px; padding-inline: 5px; }
+.firstbuy-panel fieldset .checkbox-row + .checkbox-row { margin-block-start: 8px; }
+.firstbuy-panel fieldset .checkbox-row span { overflow-wrap: anywhere; min-width: 0; }
+.firstbuy-panel details > summary { color: var(--muted); padding-block: 8px; cursor: pointer; }
+.firstbuy-panel ul { padding-inline-start: 22px; color: var(--muted); font-size: 13px; }
+.firstbuy-panel li + li { margin-block-start: 6px; }
+.firstbuy-panel .field select { max-width: 100%; }
+@media (max-width: 700px) {
+  .firstbuy-panel .field-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .firstbuy-panel .stats > div { gap: 12px; }
+}
+@media (max-width: 440px) {
+  .firstbuy-panel .field-grid { grid-template-columns: minmax(0,1fr); }
+  .firstbuy-panel .form-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .firstbuy-panel .form-actions .btn { min-width: 0; }
+}

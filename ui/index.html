@@ -8,6 +8,7 @@
   <script src="/theme.js"></script>
   <link rel="stylesheet" href="/themes.css">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/firstbuy.css">
   <script type="module" src="/app.js"></script>
 </head>
 <body>
@@ -129,22 +130,31 @@
             <div id="logs" class="logs-list"><div class="empty">暂无运行日志</div></div>
           </section>
         </section>
-        <section id="view-snipe" class="view" hidden>
+        <section id="view-snipe" class="view" data-strategy="guarded" hidden>
           <div class="page-heading">
-              <div><div class="eyebrow"><span></span>CORLA / BSC 主网</div><h1>开盘狙击</h1><p>支持单次或限次竞争；启动后自动保存可分享的速度记录。</p></div>
+              <div><div class="eyebrow"><span></span>CORLA / BSC 主网</div><h1>开盘狙击</h1><p id="snipe-strategy-description">预置首买与等待末笔为两条独立路径，不会同时启动。</p></div>
             <div class="heading-actions">
               <button id="snipe-refresh" class="btn secondary" type="button"><svg class="icon"><use href="#i-refresh"></use></svg>刷新链上</button>
-              <button id="start-snipe" class="btn primary" type="button" disabled><svg class="icon"><use href="#i-play"></use></svg>启动狙击实盘</button>
+              <button id="start-snipe" class="btn primary" type="button" hidden disabled><svg class="icon"><use href="#i-play"></use></svg>启动旧路径实盘</button>
               <button id="stop-snipe" class="btn stop" type="button" hidden><svg class="icon"><use href="#i-stop"></use></svg>停止狙击</button>
             </div>
           </div>
+          <section class="panel firstbuy-strategy-switch" aria-label="选择狙击路径">
+            <div class="panel-form">
+              <label class="field" for="snipe-strategy-mode"><span>执行路径</span><select id="snipe-strategy-mode" aria-describedby="snipe-strategy-hint">
+                <option value="guarded" selected>预置首买 · 限额竞争</option>
+                <option value="pending">等待末笔 Pending · 原路径</option>
+              </select></label>
+              <p id="snipe-strategy-hint" class="hint">切换只改变当前页面显示，不改写已保存的旧策略，也不会自动部署、注资或启动。</p>
+            </div>
+          </section>
           <div id="snipe-run-alert" class="notice danger" hidden role="alert"></div>
           <div class="overview-grid workspace-grid">
             <section class="panel projects-panel" aria-labelledby="snipe-projects-title">
               <div class="panel-heading"><div><h2 id="snipe-projects-title">狙击名单</h2><p id="snipe-block-label">等待链上快照</p><p id="snipe-refresh-status" class="refresh-status" aria-live="polite" hidden></p></div><button id="add-snipe" class="btn secondary compact" type="button"><svg class="icon"><use href="#i-plus"></use></svg>添加目标</button></div>
               <div id="snipe-projects" class="project-list"><div class="empty">正在读取本地配置…</div></div>
             </section>
-            <section class="panel monitor-panel" aria-labelledby="snipe-monitor-title">
+            <section id="snipe-legacy-monitor" class="panel monitor-panel" aria-labelledby="snipe-monitor-title" hidden>
               <div class="panel-heading"><div><h2 id="snipe-monitor-title">狙击状态</h2><p>不追买启动前已开盘的币</p></div><svg class="icon panel-icon"><use href="#i-bolt"></use></svg></div>
               <div class="monitor-inner">
                 <div class="mode-display"><span id="snipe-mode-indicator" class="dot"></span><strong id="snipe-mode-label">待机</strong></div>
@@ -160,7 +170,8 @@
               </div>
             </section>
           </div>
-          <form id="snipe-form" class="settings-stack">
+          <div id="firstbuy-workspace"></div>
+          <form id="snipe-form" class="settings-stack" hidden>
             <section class="panel">
               <div class="panel-heading"><div><h2>狙击参数</h2><p>使用钱包列表中最前面的指定数量钱包。Gas 和预算在「预算与 Gas」设置。</p></div><svg class="icon panel-icon"><use href="#i-sliders"></use></svg></div>
               <div class="panel-form">
@@ -198,7 +209,7 @@
               </div>
             </section>
           </form>
-          <section class="panel logs-panel" aria-labelledby="snipe-logs-title">
+          <section id="snipe-legacy-logs" class="panel logs-panel" aria-labelledby="snipe-logs-title" hidden>
             <div class="panel-heading"><div><h2 id="snipe-logs-title">狙击日志</h2><p>仅展示狙击工作区的最近记录</p></div><label class="sr-only" for="snipe-log-filter">狙击日志筛选</label><select id="snipe-log-filter" class="compact-select"><option value="all">全部事件</option><option value="trades">交易事件</option><option value="errors">异常和跳过</option></select></div>
             <div id="snipe-logs" class="logs-list"><div class="empty">暂无狙击日志</div></div>
           </section>

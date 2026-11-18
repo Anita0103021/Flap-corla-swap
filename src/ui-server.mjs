@@ -30,6 +30,7 @@ import { createNotificationFeed } from './notification-feed.mjs';
 import { createNotificationStream } from './notification-stream.mjs';
 import { prepareQuoteAllowances } from './quote-allowances.mjs';
 import { createFlapQuoteCatalog } from './quote-catalog.mjs';
+import { createFirstBuyService } from './firstbuy-service.mjs';
 
 const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const privateKeys = ['rpcUrl', 'rpcBackupUrls', 'walletFile', 'journalPath'];
@@ -56,12 +57,15 @@ const assets = {
   '/theme.js': ['theme.js', 'text/javascript; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/mint-wallet-selection.js': ['mint-wallet-selection.js', 'text/javascript; charset=utf-8'],
+  '/firstbuy.js': ['firstbuy.js', 'text/javascript; charset=utf-8'],
+  '/firstbuy.css': ['firstbuy.css', 'text/css; charset=utf-8'],
 };
 const postRoutes = new Set(['/api/status', '/api/discover', '/api/config', '/api/start', '/api/stop', '/api/local/lifecycle',
   '/api/wallets/import', '/api/wallets/remove', '/api/wallets/remember-local-unlock', '/api/wallets/forget-local-unlock',
   '/api/project/preview', '/api/project/participants', '/api/project/metadata',
   '/api/project/wallet-balances',
   '/api/catalog', '/api/catalog/status', '/api/catalog/resolve', '/api/catalog/funding-times', '/api/catalog/quote-assets', '/api/notifications/stream']);
+for (const action of ['status','prepare','deploy-preview','deploy','arm-preview','arm','cancel-preview','cancel','withdraw-preview','withdraw','start','stop']) postRoutes.add('/api/firstbuy/' + action);
 const headers = {
   'Cache-Control': 'no-store',
   'X-Content-Type-Options': 'nosniff',
@@ -166,7 +170,7 @@ export async function createUiServer({
   const svc = { createRpcPool, inspectMint, inspectParticipant, discoverProjects, createWalletVault, createLocalWalletUnlock, makeExecutor,
     makeMonitor, makeFastSnipe, prepareSnipe, readDashboardProjects, readDashboardParticipants, readDashboardWalletBalances,
     createProjectMetadata, readCatalogPage, findCatalogAddress, readCatalogFundingTimes, readCatalogQuoteMetadata, createNotificationFeed,
-    prepareQuoteAllowances, createFlapQuoteCatalog, ...services };
+    prepareQuoteAllowances, createFlapQuoteCatalog, createFirstBuyService, ...services };
   const vault = await svc.createWalletVault(join(root, 'state', 'wallet-vault.json'));
   const localUnlock = svc.createLocalWalletUnlock(join(root, 'state', 'wallet-unlock.dpapi'));
   const metadata = svc.createProjectMetadata();
@@ -186,6 +190,7 @@ export async function createUiServer({
   let saving = false;
   let walletWriting = false;
   let reading = false;
+  let firstBuyService;
   let lastError;
   let lastErrorWorkspace;
   let lastSnipeReport = await findLatestSnipeReport(root).catch(() => null);
@@ -250,7 +255,7 @@ export async function createUiServer({
     const floor = logSequence - logs.length;
     const delta = Number.isSafeInteger(after) && after >= floor && after <= logSequence;
     return { stateRevision: stateRevision(), configRevision, running: Boolean(run), mode: run?.mode ?? 'idle',
-      workspace: run?.workspace ?? null, stopping: Boolean(run?.controller.signal.aborted),
+      workspace: run?.workspace ?? null, taskKind: run?.kind === 'firstbuy' ? 'firstbuy' : null, stopping: Boolean(run?.controller.signal.aborted),
       starting: Boolean(run && !run.ready && !run.controller.signal.aborted), logCursor: logCursor(),
       logs: delta ? logs.slice(after - floor) : logs, ...(delta ? { logsDelta: true } : {}),
       projects: [...projects.values()], lastError, lastErrorWorkspace, snipeReport: lastSnipeReport, ...pendingState() };
@@ -721,6 +726,43 @@ export async function createUiServer({
     try { return await localUnlock.read(); }
     catch { throw new HttpError(400, '本机解锁不可用，请在钱包管理清除后重新输入原密码'); }
   }
+  function firstBuy() {
+    return firstBuyService ??= svc.createFirstBuyService({ rootDir: root,
+      getConfig: () => checked(undefined, 'mint'), getConfigRevision: () => configRevision,
+      publicWallets, hasLocalUnlock,
+      unlock: async provider => vault.unlock({ password: await localPassword(), provider }),
+      provider: cfg => readyProvider(cfg, 'snipe'), releaseProvider, makeExecutor: svc.makeExecutor,
+      runExclusive: async ({ operation, background, target, work }) => {
+        if (!allowLive) throw new HttpError(403, '此进程不允许主网首买操作');
+        if (run || saving || walletWriting || closing) throw new HttpError(409, '已有任务或本机修改，请先停止并等待完成');
+        const task = { mode: 'live', workspace: 'snipe', kind: 'firstbuy', controller: new AbortController(), ready: false, done: null };
+        let recorder, outcome, jobError;
+        let resolveReady;
+        const ready = new Promise(ok => { resolveReady = ok; });
+        run = task; stateChanged();
+        const jobLog = (event, fields = {}) => { log(event, { ...fields, workspace: 'snipe', kind: 'firstbuy' }); recorder?.record(event, fields); };
+        task.done = (async () => {
+          try {
+            recorder = await createSnipeRunRecorder({ rootDir: root, targets: target ? [target] : [], settings: {} });
+            lastSnipeReport = recorder.reportPath; stateChanged();
+            outcome = await work({ signal: task.controller.signal, log: jobLog, ready: () => {
+              task.ready = true; stateChanged(); resolveReady();
+            } });
+          } catch (e) {
+            jobError = new HttpError(400, task.controller.signal.aborted ? '首买任务已停止' : shortError(e));
+            if (!task.controller.signal.aborted) jobLog('watch_error', { error: jobError.message });
+          } finally {
+            jobLog('watch_stopped');
+            await recorder?.close().catch(() => {});
+            if (run === task) { run = null; stateChanged(); }
+            resolveReady();
+          }
+        })();
+        if (background) { await ready; if (jobError) throw jobError; return { accepted: true }; }
+        await task.done; if (jobError) throw jobError; return outcome;
+      },
+    }).catch(error => { firstBuyService = undefined; throw error; });
+  }
   async function forgetLocalUnlock() {
     if (!allowLive || !localUnlock.supported) throw new HttpError(403, '此电脑无法使用本机解锁');
     if (run || walletWriting || closing) throw new HttpError(409, '请先停止实盘，再修改钱包库解锁方式');
@@ -1060,6 +1102,13 @@ export async function createUiServer({
         }
         return json(res, 200, rpcStatus());
       }
+      if (req.method === 'GET' && pathname === '/api/firstbuy/status') {
+        if ((req.headers.origin && req.headers.origin !== origin) || !safeToken(session, sessionToken)) {
+          throw new HttpError(403, '本地会话已失效，请重新连接。', 'SESSION_EXPIRED');
+        }
+        if (closing) throw new HttpError(409, '本地服务正在停止，请稍候', 'SERVICE_STOPPING');
+        return json(res, 200, await (await firstBuy()).status());
+      }
       if (req.method !== 'POST' || !postRoutes.has(pathname)) throw new HttpError(404, '页面不存在');
       if (req.headers.origin !== origin) throw new HttpError(403, '本地会话校验失败，请刷新页面');
       if (!safeToken(session, sessionToken)) throw new HttpError(403, '本地会话已失效，请重新连接。', 'SESSION_EXPIRED');
@@ -1067,6 +1116,19 @@ export async function createUiServer({
       const body = await readBody(req);
       if (closing) throw new HttpError(409, '本地服务正在停止，请稍候', 'SERVICE_STOPPING');
       if (pathname === '/api/local/lifecycle') return acceptLifecycle(body, res);
+      if (pathname.startsWith('/api/firstbuy/')) {
+        const action = pathname.slice('/api/firstbuy/'.length), service = await firstBuy();
+        if (action === 'status') return json(res, 200, await service.status());
+        if (action === 'stop') {
+          if (run?.kind === 'firstbuy') await stop('snipe');
+          await service.stop(); return json(res, 200, await service.status());
+        }
+        if (run || saving || walletWriting) throw new HttpError(409, '请先停止当前任务，再准备或确认首买');
+        if (action === 'prepare') return json(res, 200, await service.prepare(body));
+        if (['deploy-preview','arm-preview','cancel-preview','withdraw-preview'].includes(action)) return json(res, 200, await service.preview(action.split('-')[0], body));
+        if (action === 'start' && body.confirmed !== true) return json(res, 200, await service.preview('start', body));
+        return json(res, 200, await service.confirm(action, body));
+      }
       if (pathname === '/api/notifications/stream') {
         const enabled = body.enabled;
         if (Object.keys(body).length !== 1 || !enabled || typeof enabled !== 'object' || Array.isArray(enabled) ||

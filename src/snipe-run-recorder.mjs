@@ -13,6 +13,7 @@ const EVENTS = new Set([
   'snipe_pending_source', 'snipe_pending_source_match',
   'snipe_race_mode', 'snipe_race_attempt', 'snipe_race_outcome', 'snipe_send', 'snipe_ack',
   'snipe_receipt', 'snipe_launch_index', 'snipe_first_buy', 'buy', 'buy_skipped',
+  'firstbuy_start', 'firstbuy_send', 'firstbuy_ack', 'firstbuy_receipt', 'firstbuy_paused', 'firstbuy_end',
 ]);
 const NUMBERS = [
   'attempt', 'maxAttempts', 'raceAttempts', 'repeatAttempts', 'broadcastConcurrency', 'broadcastRpcCount',
@@ -21,7 +22,7 @@ const NUMBERS = [
   'receiptIndex', 'transactionIndex', 'scanToBlock', 'scanMs', 'windowBlocks', 'deadlineSeconds',
   'preopenLots', 'slippageBps', 'maxOpeningPremiumBps', 'maxPriceImpactBps', 'maxBuyTaxBps', 'maxSellTaxBps', 'phase',
   'pendingCandidateCount', 'pendingMintCount', 'pendingSource', 'pendingSourceCount', 'pendingHealthyCount', 'pendingFullSourceCount',
-  'stalePendingCount', 'firstBuySwapCount', 'firstBuySellCount',
+  'stalePendingCount', 'firstBuySwapCount', 'firstBuySellCount', 'attempts', 'startBlock', 'endBlock', 'deadline', 'depth', 'confirmations',
   'fullMessages', 'hashMessages', 'droppedMessages', 'unrecognizedMessages', 'connections',
   'matchingPendingMessages', 'canonicalLaunches', 'matchesDuringHealthyFullFeed', 'retryMs', 'reconnects',
 ];
@@ -35,15 +36,17 @@ const QUANTITIES = [
   'effectiveGasPrice', 'maxGasPriceWei', 'gasLimitCap', 'maxTotalWei', 'reserveBnb', 'reserveQuote',
   'minLiquidity', 'pricePerLot', 'mintedLots', 'totalLots', 'remainingLots', 'batches', 'raceGasCap',
   'firstBuyTotalIn', 'firstBuyQuoteOut',
+  'gasReserved', 'maxGasWei', 'amountOut',
 ];
-const HASHES = ['txHash', 'launchTx', 'launchTxHash', 'pendingTxHash', 'blockHash', 'receiptBlockHash', 'parentHash'];
+const HASHES = ['txHash', 'launchTx', 'launchTxHash', 'pendingTxHash', 'blockHash', 'receiptBlockHash', 'parentHash', 'intentId', 'evidenceHash', 'codeHash'];
 const BOOLS = [
   'live', 'launched', 'receiptStable', 'preflightOverlapped', 'knownSuccess', 'matchedPending',
   'success', 'healthy', 'fullFeedHealthy', 'seenBeforeLocalConfirmation', 'afterLaunchSignal', 'submitted', 'requirePreopen',
   'signatureVerified', 'firstBuyAggregationComplete',
+  'bought', 'unresolved',
 ];
 const TRANSPORT = new Set(['ws', 'http', 'pending', 'confirmed']);
-const MODE = new Set(['pending', 'confirmed', 'preopen', 'repeat', 'race', 'once', 'single', 'public', 'live']);
+const MODE = new Set(['pending', 'confirmed', 'preopen', 'repeat', 'race', 'once', 'single', 'public', 'live', 'firstbuy', 'guarded']);
 const FEED = new Set([
   'ready', 'subscribed', 'connecting', 'connected', 'retrying', 'reconnecting', 'error', 'degraded',
   'disconnected', 'disabled', 'polling', 'scanning', 'active', 'busy', 'fallback', 'idle',
@@ -53,7 +56,15 @@ const FEED = new Set([
 const STATUS = new Set([
   'confirmed', 'failed', 'pending', 'skipped', 'simulated', 'submitted', 'not_submitted', 'mined',
   'accepted', 'refused', 'reverted', 'success', 'reconciled', 'exhausted', 'blocked', 'error', 'no_buy_seen',
+  'armed', 'filled', 'cancelled', 'expired', 'waiting', 'settling', 'missed', 'stopped', 'disabled', 'paused', 'bought', 'miss', 'not_filled', 'invalid_receipt',
 ]);
+const FIRSTBUY_CODES = new Set(['FIRSTBUY_ARM_UNVERIFIED','FIRSTBUY_BUDGET_EXHAUSTED','FIRSTBUY_CLOCK_UNVERIFIED',
+  'FIRSTBUY_DEPENDENCY_UNAVAILABLE','FIRSTBUY_EXECUTOR_SCHEMA_REQUIRED','FIRSTBUY_EXISTING_JOURNAL_REQUIRED',
+  'FIRSTBUY_GAS_BALANCE','FIRSTBUY_HEAD_UNVERIFIED','FIRSTBUY_INTENT_CHANGED','FIRSTBUY_INVALID_OUTCOME',
+  'FIRSTBUY_INVALID_PLAN','FIRSTBUY_INVALID_STAGE','FIRSTBUY_INVALID_STATUS','FIRSTBUY_INVALID_TIMEOUT',
+  'FIRSTBUY_JOURNAL_CLOSED','FIRSTBUY_JOURNAL_UNAVAILABLE','FIRSTBUY_NONCE_CHANGED','FIRSTBUY_NONCE_PENDING',
+  'FIRSTBUY_NONCE_ROLLBACK','FIRSTBUY_NOT_ACTIVE','FIRSTBUY_PROJECT_ALREADY_ATTEMPTED','FIRSTBUY_RECEIPT_REORG',
+  'FIRSTBUY_RECEIPT_UNVERIFIED','FIRSTBUY_SIGNED_PLAN_CHANGED','FIRSTBUY_WALLET_LEASED','FIRSTBUY_WALLET_PENDING','FIRSTBUY_WRONG_NETWORK']);
 const PAIR_EVENTS = new Interface([
   'event Swap(address indexed sender, uint256 amount0In, uint256 amount1In, uint256 amount0Out, uint256 amount1Out, address indexed to)',
 ]);
@@ -138,6 +149,8 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
   if (!fields || typeof fields !== 'object') return result;
   if (allowedMints.has(low(fields.mint))) result.mint = low(fields.mint);
   if (allowedTokens.has(low(fields.token))) result.token = low(fields.token);
+  if (isAddress(fields.contract)) result.contract = low(fields.contract);
+  if (isAddress(fields.contract) && same(fields.to, fields.contract)) result.to = low(fields.to);
   if (isAddress(fields.quoteToken) && allowedTokens.has(low(fields.token))) result.quoteToken = low(fields.quoteToken);
   for (const key of NUMBERS) if (int(fields[key])) result[key] = fields[key];
   for (const key of ['pendingReceivedAtMs', 'pendingLastFullAtMs']) {
@@ -166,6 +179,7 @@ function fieldsFor(fields, allowedMints, allowedTokens) {
   for (const key of ['raceMode', 'mode']) if (MODE.has(fields[key])) result[key] = fields[key];
   for (const key of ['pendingMode', 'phase', 'feedMode', 'mode']) if (FEED.has(fields[key])) result[key] = fields[key];
   if (STATUS.has(fields.status)) result.status = fields.status;
+  if (FIRSTBUY_CODES.has(fields.code)) result.code = fields.code;
   if (['waiting_lots', 'waiting_pending', 'stale_pending', 'ready'].includes(fields.preopenStage)) result.preopenStage = fields.preopenStage;
   if (['aggregate', 'direct'].includes(fields.marketReadMode)) result.marketReadMode = fields.marketReadMode;
   const classified = failureKind(fields);

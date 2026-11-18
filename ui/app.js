@@ -10,6 +10,7 @@ const state = {
   lastError: '', lastErrorWorkspace: null, editing: -1, pendingProjectRemove: null, pendingWalletRemove: null, liveReview: null,
   preview: null, configRevision: '', stateRevision: '', logCursor: '', reloadRequired: '', cancelingStartup: false,
   snipeReport: '', snipeTiming: null, snipePending: null,
+  firstBuyRunning: false, firstBuyBusy: false, taskKind: null,
 };
 const localService = { connected: null, supported: false, instance: '', phase: '' };
 const EXPLORER = 'https://bscscan.com';
@@ -32,6 +33,7 @@ const SNIPE_PROGRESS_LIVE_MS = 1200;
 const SNIPE_PROGRESS_IDLE_MS = 2500;
 const SNIPE_PROGRESS_BACKOFF_MS = 3800;
 let snipeProgressTimer;
+let firstBuyPanel, firstBuyUi = null, firstBuyMountedInstance = '', firstBuyStatus = null, snipeStrategy = 'guarded';
 const participantCache = new Map();
 const metadataCache = new Map();
 const metadataQueue = new Map();
@@ -361,7 +363,7 @@ const fmtTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', ho
 const fmtSnipeTime = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit',
   second: '2-digit', fractionalSecondDigits: 3, hourCycle: 'h23' });
 const configCopy = () => structuredClone(state.config);
-function frozen() { return state.running || state.stopping || state.starting || state.cancelingStartup || Boolean(state.busy || state.reloadRequired); }
+function frozen() { return state.running || state.stopping || state.starting || state.cancelingStartup || state.firstBuyRunning || state.firstBuyBusy || Boolean(state.busy || state.reloadRequired); }
 
 async function api(path, body) {
   const route = path.split('?', 1)[0];
@@ -978,6 +980,7 @@ function switchView() {
   resumeSnipeProgress();
   resumeCatalogAuto();
   resumeRpcStatus();
+  if (current === 'snipe') { syncSnipeStrategyView(); if (state.session) void firstBuyPanel?.refresh(); }
 }
 function rpcStatusVisible() {
   return Boolean(state.session) && state.reloadRequired !== 'SESSION_EXPIRED' && !$('view-settings').hidden && document.visibilityState === 'visible';
@@ -1542,7 +1545,7 @@ function renderWorkspaceControls(workspace) {
   const snipe = workspace === 'snipe';
   const prefix = snipe ? 'snipe-' : '';
   const name = workspaceNames[workspace];
-  const active = state.running || state.stopping || state.starting;
+  const active = state.running || state.stopping || state.starting || state.firstBuyRunning;
   const current = active && state.workspace === workspace;
   const disabled = !state.config;
   const start = $(snipe ? 'start-snipe' : 'start-live');
@@ -1574,12 +1577,74 @@ function renderWorkspaceControls(workspace) {
   $(prefix + 'budget-label').textContent = state.config?.maxTotalBnb ? state.config.maxTotalBnb + ' BNB' : '未设定';
   setNotice(prefix + 'run-alert', state.lastErrorWorkspace && state.lastErrorWorkspace !== workspace ? '' : state.lastError);
 }
+function syncSnipeStrategyView() {
+  const guardedActive = state.firstBuyRunning || (state.taskKind === 'firstbuy' || state.workspace === 'firstbuy') && (state.running || state.starting || state.stopping);
+  const legacyActive = !guardedActive && state.workspace === 'snipe' && (state.running || state.starting || state.stopping);
+  const busy = Boolean(state.busy || state.firstBuyBusy || state.reloadRequired);
+  const fallbackMode = guardedActive ? 'guarded' : legacyActive ? 'pending' : snipeStrategy === 'pending' ? 'pending' : 'guarded';
+  const view = firstBuyUi?.firstBuyModeProjection
+    ? firstBuyUi.firstBuyModeProjection(snipeStrategy, { legacyActive, guardedActive, busy })
+    : { mode: fallbackMode, showGuarded: fallbackMode === 'guarded', showLegacy: fallbackMode === 'pending',
+      selectionDisabled: legacyActive || guardedActive || busy };
+  snipeStrategy = view.mode;
+  $('snipe-strategy-mode').value = view.mode;
+  $('snipe-strategy-mode').disabled = view.selectionDisabled;
+  $('view-snipe').dataset.strategy = view.mode;
+  $('firstbuy-workspace').hidden = !view.showGuarded;
+  $('snipe-form').hidden = $('snipe-legacy-monitor').hidden = $('snipe-legacy-logs').hidden = !view.showLegacy;
+  if (!view.showLegacy) $('start-snipe').hidden = $('stop-snipe').hidden = true;
+  $('snipe-strategy-description').textContent = view.showGuarded
+    ? '预置目标后按限额竞争，不等待准确末笔 Pending；成功一次立即停止新投递。'
+    : '原路径：只有可用末笔通过核验与模拟后才尝试提交，不是开盘前持续投递。';
+}
+async function mountFirstBuyWorkspace() {
+  const instance = /^[a-f0-9]{16}$/.test(localService.instance) ? localService.instance : 'unknown';
+  if (firstBuyPanel && firstBuyMountedInstance === instance) return;
+  firstBuyPanel?.close();
+  firstBuyPanel = null;
+  firstBuyUi = null;
+  try {
+    // A running older backend may hot-serve new app.js before its asset map
+    // includes firstbuy.js. Keep the established app usable in that case.
+    firstBuyUi = await import('./firstbuy.js?v=' + instance);
+  } catch {
+    $('firstbuy-workspace').replaceChildren(element('p', 'notice',
+      '后台尚未加载新版首买资源，需重启本地服务。原路径仍可手动切换；不会自动启动任何交易。'));
+    syncSnipeStrategyView();
+    return;
+  }
+  firstBuyMountedInstance = instance;
+  firstBuyPanel = firstBuyUi.mountFirstBuyPanel($('firstbuy-workspace'), {
+    api,
+    getTargets: () => targetsOf('snipe').map(target => {
+      const parsed = parsedTarget(target), meta = metadataCache.get(projectKey(parsed ?? {}));
+      return { ...target, label: `${meta?.name || meta?.symbol || '项目'} · ${short(parsed?.token)}` };
+    }),
+    getWallets: () => state.wallets,
+    getReport: () => state.snipeReport,
+    getDefaults: () => ({ amountBnb: state.config?.snipe?.amountBnb ?? '0.05', maxTotalBnb: state.config?.maxTotalBnb ?? '0.5' }),
+    getBlockReason: () => state.reloadRequired ? '本地会话或配置已变化，请重新连接后核对。' :
+      !state.allowLive ? '当前服务未开放主网操作。' :
+      state.running && state.taskKind !== 'firstbuy' && state.workspace !== 'firstbuy' && !state.firstBuyRunning ? '请先停止正在运行的旧工作区，再进行预置首买操作。' :
+      state.busy ? '其他本地操作正在处理，请稍候。' : '',
+    onBusyChange: busy => {
+      if (state.firstBuyBusy !== busy) { state.firstBuyBusy = busy; renderControls(); }
+    },
+    onStateChange: (status, meta) => {
+      firstBuyStatus = status;
+      const active = Boolean(meta?.uncertain || status && (status.running === true || status.unknownSubmission === true || ['running', 'settling'].includes(status.status)));
+      if (state.firstBuyRunning !== active) { state.firstBuyRunning = active; renderControls(); }
+    },
+  });
+  void firstBuyPanel.refresh();
+}
 function renderControls() {
   const disabled = !state.config;
   renderLocalService();
   renderWorkspaceControls('mint');
   renderWorkspaceControls('snipe');
   renderSnipePending();
+  syncSnipeStrategyView();
   const cancel = $('live-cancel-startup');
   const ownWorkspace = pendingLiveStart?.workspace === state.workspace;
   const checking = state.busy === 'start' || state.cancelingStartup;
@@ -2374,6 +2439,7 @@ function applyRunState(data, fallbackWorkspace = 'mint') {
   state.running = Boolean(data.running);
   state.mode = data.mode;
   state.workspace = data.workspace ?? (state.running ? fallbackWorkspace : null);
+  state.taskKind = data.taskKind === 'firstbuy' ? 'firstbuy' : null;
   state.starting = Boolean(data.starting);
   state.stopping = Boolean(data.stopping);
   state.snipePending = state.workspace === 'snipe' ? data.snipePending ?? null : null;
@@ -3179,6 +3245,7 @@ function syncSnipeOpeningPolicy() {
   preview.hidden = !text;
 }
 function reviewLive(workspace) {
+  if (workspace === 'snipe' && snipeStrategy !== 'pending') return;
   if (!liveAvailable(workspace) || frozen()) return;
   const config = configCopy();
   const wallets = state.wallets.map(({ address }) => address);
@@ -3378,6 +3445,12 @@ for (const [workspace, buttonIds] of Object.entries({ mint: ['refresh', 'start-l
   $(startId).addEventListener('click', () => reviewLive(workspace));
   $(stopId).addEventListener('click', () => stopWorkspace(workspace));
 }
+$('snipe-strategy-mode').addEventListener('change', event => {
+  if (state.running || state.firstBuyRunning || state.firstBuyBusy || state.busy || state.reloadRequired) return;
+  snipeStrategy = event.target.value === 'pending' ? 'pending' : 'guarded';
+  renderControls();
+  if (snipeStrategy === 'guarded') void firstBuyPanel?.refresh();
+});
 async function stopWorkspace(workspace) {
   if (state.busy || state.stopping || state.cancelingStartup || state.reloadRequired === 'SESSION_EXPIRED') return;
   setBusy('stop');
@@ -3552,6 +3625,7 @@ async function boot() {
     state.walletLocalUnlockSupported = data.walletLocalUnlockSupported === true;
     state.walletLocalUnlock = data.walletLocalUnlock === true;
     setWallets(data.walletVault);
+    await mountFirstBuyWorkspace();
     renderConfigForms();
     renderControls();
     renderProjects();

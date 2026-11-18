@@ -6,11 +6,25 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Local Flap Corla BSC mint, claim and launch monitor",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "start": "node src/cli.mjs",
-    "test": "node --test",
+    "test": "node scripts/run-tests.mjs",
+    "test:firstbuy": "node scripts/run-tests.mjs --firstbuy",
+    "compile:firstbuy": "node scripts/compile-firstbuy.mjs",
     "ui": "node src/ui-server.mjs"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "solc": "0.8.38"
+  },
+  "optionalDependencies": {
+    "@foundry-rs/anvil-darwin-amd64": "1.7.1",
+    "@foundry-rs/anvil-darwin-arm64": "1.7.1",
+    "@foundry-rs/anvil-linux-amd64": "1.7.1",
+    "@foundry-rs/anvil-linux-arm64": "1.7.1",
+    "@foundry-rs/anvil-win32-amd64": "1.7.1"
+  }
 }
